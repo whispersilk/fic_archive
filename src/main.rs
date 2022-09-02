@@ -2,6 +2,7 @@ use tokio::io::{stdout, AsyncWriteExt as _};
 use tokio::runtime;
 
 use self::error::ArchiveError;
+use self::structs::Content;
 
 mod error;
 mod parser;
@@ -11,6 +12,23 @@ fn main() -> Result<(), ArchiveError> {
     let runtime = runtime::Runtime::new()?;
     let story = parser::katalepsis::get_story(&runtime)?;
     println!("{}", story.chapters.len());
+    for chapter in story.chapters.iter() {
+        match chapter {
+            Content::Chapter {
+                name,
+                description: _,
+                text: _,
+                url: _,
+                date_posted: _,
+            } => println!("{}", name),
+            Content::Section {
+                name,
+                description: _,
+                chapters,
+                url: _,
+            } => println!("{} ({} chapters)", name, chapters.len()),
+        }
+    }
 
     // stdout().write_all(format!("{}\n", chapters.next().unwrap().await.1).as_bytes()).await?;
     /*for chapter in chapters {

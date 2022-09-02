@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use chrono::DateTime;
 use futures::future::join_all;
 use reqwest::{Client, Response};
@@ -9,7 +11,7 @@ use tokio::runtime::Runtime;
 
 use crate::{
     error::ArchiveError,
-    structs::{ChapterBuilder, Content, Story, StoryBuilder},
+    structs::{ChapterBuilder, Content, SectionBuilder, Story, StoryBuilder},
 };
 
 pub fn get_story(runtime: &Runtime) -> Result<Story, ArchiveError> {
@@ -90,16 +92,82 @@ pub fn get_story(runtime: &Runtime) -> Result<Story, ArchiveError> {
             builder.build()
         })
         .collect();
+    let sections: Vec<Content> = chapters
+        .into_iter()
+        .map(|c| c.unwrap())
+        .fold(
+            BTreeMap::new(),
+            |mut acc: BTreeMap<u16, Vec<Content>>, chapter| {
+                let arc_num = match chapter {
+                    Content::Chapter {
+                        ref name,
+                        description: _,
+                        text: _,
+                        url: _,
+                        date_posted: _,
+                    } => {
+                        let idx = name
+                            .find(" –")
+                            .expect(&format!("Did not find pattern in {}", name));
+                        let pieces = name.split_at(idx);
+                        let number = pieces
+                            .1
+                            .find(|c: char| c.is_ascii_digit())
+                            .expect(&format!("Did not find digit in {}", pieces.1));
+                        let number = pieces.1.split_at(number).1;
+                        let number = number.split_at(number.find('.').unwrap()).0;
+                        number
+                            .parse::<u16>()
+                            .expect(&format!("{} should be an int", number))
+                    }
+                    _ => unreachable!("All Content at this point are Chapters"),
+                };
+                match acc.get(&arc_num) {
+                    None => {
+                        let new_vec = Vec::new();
+                        acc.insert(arc_num, new_vec);
+                    }
+                    _ => (),
+                }
+                acc.get_mut(&arc_num).unwrap().push(chapter);
+                acc
+            },
+        )
+        .into_iter()
+        .map(|(arc_num, chapters)| {
+            let mut section_builder: SectionBuilder = Default::default();
+            section_builder
+                .name(format!("Arc {}: {}", arc_num, get_arc_name_from_chapter_name(
+                    if let Some(Content::Chapter {
+                        name,
+                        description: _,
+                        text: _,
+                        url: _,
+                        date_posted: _,
+                    }) = chapters.get(0)
+                    {
+                        name
+                    } else {
+                        ""
+                    },
+                )))
+                .chapters(chapters)
+                .build()
+                .unwrap()
+        })
+        .collect();
 
     let mut story_builder: StoryBuilder = Default::default();
     story_builder
         .name("Katalepsis")
-        .chapters(
-            chapters
-                .into_iter()
-                .map(|chapter| chapter.unwrap())
-                .collect::<Vec<Content>>(),
-        )
+        .chapters(sections)
         .url("https://katalepsis.net")
         .build()
+}
+
+fn get_arc_name_from_chapter_name(chapter_name: &str) -> String {
+    let idx = chapter_name
+        .find(" –")
+        .expect(&format!("Did not find pattern in {}", chapter_name));
+    chapter_name.split_at(idx).0.to_owned()
 }
