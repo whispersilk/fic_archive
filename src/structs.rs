@@ -1,18 +1,18 @@
 use chrono::{DateTime, FixedOffset};
-use std::convert::Into;
+use regex::Regex;
 
-use crate::error::ArchiveError;
-
-#[derive(Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Story {
     pub name: String,
+    pub author: Author,
     pub description: Option<String>,
     pub url: String,
     pub tags: Vec<String>,
     pub chapters: Vec<Content>,
+    pub source: StorySource,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Content {
     Section {
         name: String,
@@ -29,178 +29,87 @@ pub enum Content {
     },
 }
 
-#[derive(Clone, Default)]
-pub struct StoryBuilder {
-    name: Option<String>,
-    description: Option<String>,
-    url: Option<String>,
-    tags: Option<Vec<String>>,
-    chapters: Option<Vec<Content>>,
+#[derive(Debug, Clone)]
+pub struct Author {
+    pub name: String,
+    pub id: String,
 }
 
-impl StoryBuilder {
-    pub fn name<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.name = Some(value.into());
-        new
-    }
-    pub fn description<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.description = Some(value.into());
-        new
-    }
-    pub fn url<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.url = Some(value.into());
-        new
-    }
-    pub fn tags<T: Into<Vec<String>>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.tags = Some(value.into());
-        new
-    }
-    pub fn chapters<T: Into<Vec<Content>>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.chapters = Some(value.into());
-        new
-    }
-    pub fn build(&self) -> Result<Story, ArchiveError> {
-        Ok(Story {
-            name: self
-                .name
-                .as_ref()
-                .ok_or(ArchiveError::StoryBuild(
-                    "No name provided before building Story",
-                ))?
-                .clone(),
-            description: self.description.clone(),
-            url: self
-                .url
-                .as_ref()
-                .ok_or(ArchiveError::StoryBuild(
-                    "No description provided before building Story",
-                ))?
-                .clone(),
-            tags: self.tags.as_ref().unwrap_or(&Vec::new()).clone(),
-            chapters: self.chapters.as_ref().unwrap_or(&Vec::new()).clone(),
-        })
-    }
+#[derive(Debug, Clone)]
+pub struct StoryBase {
+    pub title: String,
+    pub author: Author,
+    pub chapter_links: Vec<ChapterLink>,
 }
 
-#[derive(Clone, Default)]
-pub struct SectionBuilder {
-    name: Option<String>,
-    description: Option<String>,
-    chapters: Option<Vec<Content>>,
-    url: Option<String>,
+#[derive(Debug, Clone)]
+pub struct ChapterLink {
+    pub url: String,
+    pub title: String,
 }
 
-impl SectionBuilder {
-    pub fn name<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.name = Some(value.into());
-        new
-    }
-    pub fn description<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.description = Some(value.into());
-        new
-    }
-    pub fn chapters<T: Into<Vec<Content>>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.chapters = Some(value.into());
-        new
-    }
-    pub fn url<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.url = Some(value.into());
-        new
-    }
-    pub fn build(&self) -> Result<Content, ArchiveError> {
-        Ok(Content::Section {
-            name: self
-                .name
-                .as_ref()
-                .ok_or(ArchiveError::ContentBuild(
-                    "No name provided before building Content::Section",
-                ))?
-                .clone(),
-            description: self.description.clone(),
-            chapters: if let Some(chaps) = &self.chapters {
-                chaps.clone()
-            } else {
-                Vec::new()
-            },
-            url: self.url.clone(),
-        })
-    }
+#[derive(Debug, Clone)]
+pub enum TextFormat {
+    #[allow(dead_code)]
+    Html,
+    Markdown,
 }
 
-#[derive(Clone, Default)]
-pub struct ChapterBuilder {
-    name: Option<String>,
-    description: Option<String>,
-    text: Option<String>,
-    url: Option<String>,
-    date_posted: Option<DateTime<FixedOffset>>,
+#[derive(Debug, Clone)]
+pub enum StorySource {
+    Katalepsis,
+    RoyalRoad(String),
 }
 
-impl ChapterBuilder {
-    pub fn name<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.name = Some(value.into());
-        new
+static KATALEPSIS_REGEX: (&'static str, once_cell::sync::OnceCell<regex::Regex>) = (
+    r"https?://katalepsis\.net/?.*",
+    once_cell::sync::OnceCell::new(),
+);
+static ROYALROAD_REGEX: (&'static str, once_cell::sync::OnceCell<regex::Regex>) = (
+    r"https?://(?:www)?\.royalroad\.com/fiction/(\d+)/?\.*",
+    once_cell::sync::OnceCell::new(),
+);
+
+impl StorySource {
+    pub fn from_url(url: &str) -> StorySource {
+        if KATALEPSIS_REGEX
+            .1
+            .get_or_init(|| Regex::new(KATALEPSIS_REGEX.0).unwrap())
+            .is_match(url)
+        {
+            StorySource::Katalepsis
+        } else if ROYALROAD_REGEX
+            .1
+            .get_or_init(|| Regex::new(ROYALROAD_REGEX.0).unwrap())
+            .is_match(url)
+        {
+            let story_id = ROYALROAD_REGEX
+                .1
+                .get()
+                .unwrap()
+                .captures(url)
+                .unwrap()
+                .get(1)
+                .expect("Url must contain a story id")
+                .as_str()
+                .to_owned();
+            StorySource::RoyalRoad(story_id)
+        } else {
+            panic!("URL did not match any available schema.")
+        }
     }
-    pub fn description<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.description = Some(value.into());
-        new
+
+    pub fn to_id(&self) -> String {
+        match self {
+            StorySource::Katalepsis => "katalepsis".to_owned(),
+            StorySource::RoyalRoad(ref id) => format!("rr:{}", id),
+        }
     }
-    pub fn text<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.text = Some(value.into());
-        new
-    }
-    pub fn url<T: Into<String>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.url = Some(value.into());
-        new
-    }
-    pub fn date_posted<T: Into<DateTime<FixedOffset>>>(&mut self, value: T) -> &mut Self {
-        let mut new = self;
-        new.date_posted = Some(value.into());
-        new
-    }
-    pub fn build(&self) -> Result<Content, ArchiveError> {
-        Ok(Content::Chapter {
-            name: self
-                .name
-                .as_ref()
-                .ok_or(ArchiveError::ContentBuild(
-                    "No name provided before building Content::Chapter",
-                ))?
-                .clone(),
-            description: self.description.clone(),
-            text: self
-                .text
-                .as_ref()
-                .ok_or(ArchiveError::ContentBuild(
-                    "No text provided before building Content::Chapter",
-                ))?
-                .clone(),
-            url: self
-                .url
-                .as_ref()
-                .ok_or(ArchiveError::ContentBuild(
-                    "No url provided before building Content::Chapter",
-                ))?
-                .clone(),
-            date_posted: self
-                .date_posted
-                .ok_or(ArchiveError::ContentBuild(
-                    "No date_posted provided before building Content::Chapter",
-                ))?
-                .clone(),
-        })
+
+    pub fn to_url(&self) -> String {
+        match self {
+            StorySource::Katalepsis => "https://katalepsis.net/table-of-contents".to_owned(),
+            StorySource::RoyalRoad(id) => format!("https://www.royalroad.com/fiction/{}", id),
+        }
     }
 }
