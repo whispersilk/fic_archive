@@ -15,18 +15,29 @@ pub struct Story {
 #[derive(Debug, Clone)]
 pub enum Content {
     Section {
+        id: String,
         name: String,
         description: Option<String>,
         chapters: Vec<Content>,
         url: Option<String>,
     },
     Chapter {
+        id: String,
         name: String,
         description: Option<String>,
         text: String,
         url: String,
         date_posted: DateTime<FixedOffset>,
     },
+}
+
+impl Content {
+    pub fn get_id(&self) -> &str {
+        match self {
+            Content::Section { id, .. } => &id,
+            Content::Chapter { id, .. } => &id,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -61,11 +72,11 @@ pub enum StorySource {
     RoyalRoad(String),
 }
 
-static KATALEPSIS_REGEX: (&'static str, once_cell::sync::OnceCell<regex::Regex>) = (
+static KATALEPSIS_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) = (
     r"https?://katalepsis\.net/?.*",
     once_cell::sync::OnceCell::new(),
 );
-static ROYALROAD_REGEX: (&'static str, once_cell::sync::OnceCell<regex::Regex>) = (
+static ROYALROAD_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) = (
     r"https?://(?:www)?\.royalroad\.com/fiction/(\d+)/?\.*",
     once_cell::sync::OnceCell::new(),
 );

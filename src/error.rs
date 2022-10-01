@@ -4,6 +4,7 @@ use std::fmt;
 pub enum ArchiveError {
     Io(std::io::Error),
     Request(reqwest::Error),
+    Database(rusqlite::Error),
 }
 
 impl fmt::Display for ArchiveError {
@@ -11,6 +12,7 @@ impl fmt::Display for ArchiveError {
         match *self {
             ArchiveError::Io(ref err) => err.fmt(f),
             ArchiveError::Request(ref err) => err.fmt(f),
+            ArchiveError::Database(ref err) => err.fmt(f),
         }
     }
 }
@@ -24,5 +26,11 @@ impl From<std::io::Error> for ArchiveError {
 impl From<reqwest::Error> for ArchiveError {
     fn from(err: reqwest::Error) -> ArchiveError {
         ArchiveError::Request(err)
+    }
+}
+
+impl From<rusqlite::Error> for ArchiveError {
+    fn from(err: rusqlite::Error) -> ArchiveError {
+        ArchiveError::Database(err)
     }
 }
