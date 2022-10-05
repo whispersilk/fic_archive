@@ -1,6 +1,6 @@
-use chrono::DateTime;
 use crate::error::ArchiveError;
 use crate::Content;
+use chrono::DateTime;
 use rusqlite::{Connection, Error, Result};
 
 use crate::structs::Story;
@@ -54,75 +54,109 @@ pub fn create_tables(conn: &Connection) -> Result<(), Error> {
 pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, ArchiveError> {
     create_tables(conn)?;
     let mut stmt = conn.prepare("SELECT COUNT(1) FROM stories WHERE id = :id")?;
-    let story_exists = stmt.query_map(&[(":id", id)], |row| match row.get(0) {
-    	Ok(0) => Ok(None),
-    	Ok(1) => Ok(Some(())),
-    	_ => Ok(None),
-    }).unwrap().next().is_some();
+    let story_exists = stmt
+        .query_map(&[(":id", id)], |row| match row.get(0) {
+            Ok(0) => Ok(None),
+            Ok(1) => Ok(Some(())),
+            _ => Ok(None),
+        })
+        .unwrap()
+        .next()
+        .is_some();
     if !story_exists {
         Ok(None)
     } else {
-        stmt = conn.prepare("SELECT id, name, description, url, parent_id FROM sections WHERE story_id = :story_id")?;
-        let mut sections: Vec<(Option<String>, Content)> = stmt.query_map(&[(":story_id", id)], |row| {
-            let section_id = row.get::<usize, String>(4)?;
-            let section_id = match section_id.as_str() {
-                "NULL" => None,
-                _ => Some(section_id),
-            };
-            Ok((section_id, Content::Section {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: {
-                    let desc: String = row.get(2)?;
-                    match desc.as_str() {
-                        "NULL" => None,
-                        _ => Some(desc),
-                    }
-                },
-                chapters: Vec::new(),
-                url: {
-                    let url: String = row.get(2)?;
-                    match url.as_str() {
-                        "NULL" => None,
-                        _ => Some(url),
-                    }
-                },
-            }))
-        })?
-        .map(|sec| sec.unwrap()).collect();
+        stmt = conn.prepare(
+            "SELECT id, name, description, url, parent_id FROM sections WHERE story_id = :story_id",
+        )?;
+        let mut sections: Vec<(Option<String>, Content)> = stmt
+            .query_map(&[(":story_id", id)], |row| {
+                let section_id = row.get::<usize, String>(4)?;
+                let section_id = match section_id.as_str() {
+                    "NULL" => None,
+                    _ => Some(section_id),
+                };
+                Ok((
+                    section_id,
+                    Content::Section {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        description: {
+                            let desc: String = row.get(2)?;
+                            match desc.as_str() {
+                                "NULL" => None,
+                                _ => Some(desc),
+                            }
+                        },
+                        chapters: Vec::new(),
+                        url: {
+                            let url: String = row.get(2)?;
+                            match url.as_str() {
+                                "NULL" => None,
+                                _ => Some(url),
+                            }
+                        },
+                    },
+                ))
+            })?
+            .map(|sec| sec.unwrap())
+            .collect();
 
         stmt = conn.prepare("SELECT id, name, description, text, url, date_posted, section_id FROM chapters WHERE story_id = :story_id")?;
-        let chapters: Vec<(Option<String>, Content)> = stmt.query_map(&[(":story_id", id)], |row| {
-            let section_id = row.get::<usize, String>(6)?;
-            let section_id = match section_id.as_str() {
-                "NULL" => None,
-                _ => Some(section_id),
-            };
-            Ok((section_id , Content::Chapter {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                description: {
-                    let desc: String = row.get(2)?;
-                    match desc.as_str() {
-                        "NULL" => None,
-                        _ => Some(desc),
-                    }
-                },
-                text: row.get(3)?,
-                url: row.get(4)?,
-                date_posted: DateTime::parse_from_rfc3339({ let s: String = row.get(5)?; s.clone().as_str()}).unwrap_or_else(|_| {
-                    panic!(
-                        "Chapter posted-on date ({:?}) did not conform to rfc3339",
-                        row.get::<usize, String>(5)
-                    )
-                }),
-            }))
-        })?
-        .map(|chap| chap.unwrap()).collect();
+        let chapters: Vec<(Option<String>, Content)> = stmt
+            .query_map(&[(":story_id", id)], |row| {
+                let section_id = row.get::<usize, String>(6)?;
+                let section_id = match section_id.as_str() {
+                    "NULL" => None,
+                    _ => Some(section_id),
+                };
+                Ok((
+                    section_id,
+                    Content::Chapter {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        description: {
+                            let desc: String = row.get(2)?;
+                            match desc.as_str() {
+                                "NULL" => None,
+                                _ => Some(desc),
+                            }
+                        },
+                        text: row.get(3)?,
+                        url: row.get(4)?,
+                        date_posted: DateTime::parse_from_rfc3339({
+                            let s: String = row.get(5)?;
+                            s.clone().as_str()
+                        })
+                        .unwrap_or_else(|_| {
+                            panic!(
+                                "Chapter posted-on date ({:?}) did not conform to rfc3339",
+                                row.get::<usize, String>(5)
+                            )
+                        }),
+                    },
+                ))
+            })?
+            .map(|chap| chap.unwrap())
+            .collect();
 
         if !sections.is_empty() {
-            for chap in chapters.into_iter().filter(|chap| chap.0.is_some()).map(|chap| (chap.0.unwrap(), chap.1)) {
-                let (parent_id, section) = sections.iter_mut().find(|sec| sec.1.get_id() == chap.0).expect(format!("Chapter with id {} points to non-existent section with id {}", chap.1.get_id(), chap.0).as_str());
+            for chap in chapters
+                .into_iter()
+                .filter(|chap| chap.0.is_some())
+                .map(|chap| (chap.0.unwrap(), chap.1))
+            {
+                let (parent_id, section) = sections
+                    .iter_mut()
+                    .find(|sec| sec.1.get_id() == chap.0)
+                    .expect(
+                        format!(
+                            "Chapter with id {} points to non-existent section with id {}",
+                            chap.1.get_id(),
+                            chap.0
+                        )
+                        .as_str(),
+                    );
                 assert!(matches!(section, Content::Section { .. }));
                 section.chapters.push(chap.1);
             }

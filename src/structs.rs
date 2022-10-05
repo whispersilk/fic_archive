@@ -68,10 +68,15 @@ pub enum TextFormat {
 
 #[derive(Debug, Clone)]
 pub enum StorySource {
+    FFNet(String),
     Katalepsis,
     RoyalRoad(String),
 }
 
+static FFNET_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) = (
+    r"https?://(?:www)?\.fanfiction\.net/s/(\d+)/?\.*",
+    once_cell::sync::OnceCell::new(),
+);
 static KATALEPSIS_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) = (
     r"https?://katalepsis\.net/?.*",
     once_cell::sync::OnceCell::new(),
@@ -105,6 +110,22 @@ impl StorySource {
                 .as_str()
                 .to_owned();
             StorySource::RoyalRoad(story_id)
+        } else if FFNET_REGEX
+            .1
+            .get_or_init(|| Regex::new(FFNET_REGEX.0).unwrap())
+            .is_match(url)
+        {
+            let story_id = FFNET_REGEX
+                .1
+                .get()
+                .unwrap()
+                .captures(url)
+                .unwrap()
+                .get(1)
+                .expect("Url must contain a story id")
+                .as_str()
+                .to_owned();
+            StorySource::FFNet(story_id)
         } else {
             panic!("URL did not match any available schema.")
         }
@@ -112,6 +133,7 @@ impl StorySource {
 
     pub fn to_id(&self) -> String {
         match self {
+            StorySource::FFNet(ref id) => format!("ffnet:{}", id),
             StorySource::Katalepsis => "katalepsis".to_owned(),
             StorySource::RoyalRoad(ref id) => format!("rr:{}", id),
         }
@@ -119,6 +141,7 @@ impl StorySource {
 
     pub fn to_url(&self) -> String {
         match self {
+            StorySource::FFNet(id) => format!("https://www.fanfiction.net/s/{}", id),
             StorySource::Katalepsis => "https://katalepsis.net/table-of-contents".to_owned(),
             StorySource::RoyalRoad(id) => format!("https://www.royalroad.com/fiction/{}", id),
         }
