@@ -1,85 +1,198 @@
-use html2md::parse_html;
-use pandoc::{InputFormat, InputKind, OutputFormat, OutputKind, PandocOutput};
-use select::node::Node;
-use std::collections::BTreeMap;
-use std::iter;
-
-use chrono::DateTime;
+use tokio::io::AsyncWriteExt;
+use chrono::{DateTime, FixedOffset, TimeZone};
 use futures::future::join_all;
-use rayon::prelude::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-use reqwest::{Client, Response};
+use reqwest::Client;
 use select::{
     document::Document,
+    node::Data::Text,
+    node::Node,
     predicate::{self, Predicate},
 };
 use tokio::runtime::Runtime;
 
+use std::iter;
+
 use crate::{
     error::ArchiveError,
-    structs::{Author, ChapterLink, Content, Story, StorySource, TextFormat},
+    parser::{custom_convert_to_format, Parser},
+    structs::{Author, Chapter, Content, Section, Story, StorySource, TextFormat},
 };
 
-pub fn get_chapter_list(
-    runtime: &Runtime,
-    client: &Client,
-) -> Result<Vec<ChapterLink>, ArchiveError> {
-    let main_page = runtime.block_on(async {
-        let intermediate = client
-            .get("https://katalepsis.net/table-of-contents/")
-            .send()
-            .await?;
-        intermediate.text().await
-    })?;
+pub(crate) struct KatalepsisParser;
 
-    let document = Document::from_read(main_page.as_bytes())?;
-    let pages = document
-        .find(predicate::Class("entry-content").descendant(predicate::Name("a")))
-        .map(|link| ChapterLink {
-            url: link
-                .attr("href")
-                .expect("A link in the ToC had no href")
-                .to_owned(),
-            title: link.text().trim().to_owned(),
-        })
-        .collect();
-    Ok(pages)
-}
-
-pub fn get_story(runtime: &Runtime, format: TextFormat) -> Result<Story, ArchiveError> {
-    let client = Client::new();
-
-    let chapter_listing = get_chapter_list(runtime, &client)?;
-    let pages = chapter_listing
-        .into_iter()
-        .map(|chapter| chapter.url)
-        .map(|href| client.get(href).send());
-    let mut chapter_pages = runtime.block_on(async { join_all(pages).await });
-    for idx in 0..chapter_pages.len() {
-        let elem = chapter_pages.get(idx).unwrap();
-        if elem.is_err() {
-            let err = chapter_pages.remove(idx).unwrap_err();
-            return Err(ArchiveError::Request(err));
+fn chapters_from_section<'a>(section: &'a mut Section, vec: &mut Vec<&'a mut Chapter>) -> () {
+    for content in section.chapters.iter_mut() {
+        match content {
+            Content::Section(sec) => chapters_from_section(sec, vec),
+            Content::Chapter(chap) => vec.push(chap),
         }
     }
-    let mut chapter_urls: Vec<String> = Vec::with_capacity(chapter_pages.len());
-    let chapter_pages: Vec<Response> = chapter_pages
-        .into_iter()
-        .map(|page| page.unwrap())
-        .collect();
-    for idx in 0..chapter_pages.len() {
-        chapter_urls.push(chapter_pages.get(idx).unwrap().url().as_str().to_owned());
+}
+
+impl Parser for KatalepsisParser {
+    fn get_skeleton(
+        &self,
+        runtime: &Runtime,
+        client: &Client,
+        format: &TextFormat,
+        source: StorySource,
+    ) -> Result<Story, ArchiveError> {
+        let main_page = runtime.block_on(async {
+            client
+                .get("https://katalepsis.net/")
+                .send()
+                .await?
+                .text()
+                .await
+        })?;
+        let main_page = Document::from_read(main_page.as_bytes())?;
+
+        let name = "Katalepsis".to_owned();
+        let author = Author::new("HY", "katalepsis:");
+        let description: Option<String> = Some(
+            main_page
+                .find(predicate::Class("entry-content").child(predicate::Name("p")))
+                .take(3)
+                .map(|elem| elem.inner_html())
+                .map(|html| custom_convert_to_format(html, &format, Some(Box::new(custom_convert))))
+                .collect(),
+        );
+        let url = "https://katalepsis.net".to_owned();
+        let tags: Vec<String>= Vec::new();
+        let chapters: Vec<Content> = main_page
+            .find(predicate::Attr("id", "secondary").child(predicate::Name("aside")))
+            .filter(|node| match node.first_child() {
+                None => false,
+                Some(child) => match (child.name(), child.text().as_str()) {
+                    (Some("h3"), "Archive") => true,
+                    _ => false,
+                },
+            })
+            .next()
+            .expect("Could not find post archive in right-hand panel")
+            .children()
+            .filter(|node| if let Some("textwidget") = node.attr("class") { true } else { false })
+            .next()
+            .expect("Post archive is empty")
+            .children()
+            .filter(|child| {
+                if let Some("ul") = child.name() {
+                    true
+                } else {
+                    false
+                }
+            })
+            .flat_map(|arc_ul| arc_ul.children())
+            .filter(|arc_li| arc_li.name().is_some())
+            .map(|arc_li| {
+                let arc_name = arc_li
+                    .children()
+                    .filter(|child| {
+                        if let Text(_) = child.data() {
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .next();
+                if let None = arc_name {
+                    println!("Arc name was none for:\n{:?}", arc_li);
+                }
+                let arc_name = arc_name
+                    .expect("<li> for arc should have a text node with arc name")
+                    .text()
+                    .replacen('(', "", 1)
+                    .replacen(')', ":", 1);
+                let arc_num = &arc_name[4..arc_name.find(':').unwrap()];
+                let chapters = arc_li
+                    .children()
+                    .filter(|child| {
+                        if let Some("ul") = child.name() {
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .next()
+                    .expect("<li> for arc should have a <ul> for chapters")
+                    .children()
+                    .filter(|chapter_li| match chapter_li.first_child() {
+                        Some(child) => {
+                            if let Some("a") = child.name() {
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => false,
+                    })
+                    .map(|chapter_li| chapter_li.first_child().unwrap())
+                    .map(|a_tag| {
+                        let chap_num_owner = a_tag.text();
+                        let chap_num = chap_num_owner.split(".").skip(1).next().expect(&format!(
+                            "Chapter number should be of the format X.Y but is {}",
+                            a_tag.text()
+                        ));
+                        Content::Chapter(Chapter {
+                            id: format!("katalepsis:{}:{}", arc_num, chap_num),
+                            name: format!("{} - {}", arc_name, a_tag.text()),
+                            description: None,
+                            text: String::new(),
+                            url: a_tag
+                                .attr("href")
+                                .expect("Chapter tag should have an href")
+                                .to_owned(),
+                            date_posted: FixedOffset::east(0).datetime_from_str("0", "%s").unwrap(),
+                        })
+                    })
+                    .collect();
+                Content::Section(Section {
+                    id: format!("katalepsis:{}", arc_num),
+                    name: arc_name,
+                    description: None,
+                    chapters,
+                    url: None,
+                })
+            })
+            .collect();
+
+        Ok(Story {
+            name,
+            author,
+            description,
+            url,
+            tags,
+            chapters,
+            source,
+        })
     }
-    let sections: Vec<Content> = runtime
-        .block_on(async { join_all(chapter_pages.into_iter().map(|page| page.text())).await })
-        .into_par_iter()
-        .zip(chapter_urls) // Pair of (text, url)
-        .map(|page_plus_url| {
-            let document = Document::from_read(page_plus_url.0?.as_bytes())?;
-            let title = document
-                .find(predicate::Class("entry-header").child(predicate::Class("entry-title")))
-                .next()
-                .expect("Chapter does not have title")
-                .text();
+
+    fn get_story(
+        &self,
+        runtime: &Runtime,
+        format: &TextFormat,
+        source: StorySource,
+    ) -> Result<Story, ArchiveError> {
+        let client = Client::new();
+        let mut story = self.get_skeleton(runtime, &client, &format, source).unwrap();
+
+        let mut chapters: Vec<&mut Chapter> = Vec::with_capacity(story.num_chapters());
+        for content in story.chapters.iter_mut() {
+            match content {
+                Content::Section(sec) => chapters_from_section(sec, &mut chapters),
+                Content::Chapter(chap) => chapters.push(chap),
+            }
+        }
+        println!("Chapters: {}", chapters.len());
+        for chap in chapters.iter() {
+            println!("Chapter name is: \"{}\"", chap.name);
+        }
+
+        let hydrate = chapters.into_iter().map(|chap| async {
+            tokio::io::stdout().write_all(format!("About to fetch chapter {}\n", chap.name).as_bytes()).await.unwrap();
+            let page = client.get(&chap.url).send().await?.text().await?;
+            tokio::io::stdout().write_all(format!("Done fetching chapter {}\n", chap.name).as_bytes()).await.unwrap();
+            let document = Document::from_read(page.as_bytes())?;
 
             let mut cw_empty_owner;
             let mut cw_some_owner;
@@ -150,7 +263,7 @@ pub fn get_story(runtime: &Runtime, format: TextFormat) -> Result<Story, Archive
                 .filter(|html| {
                     !html.contains(">Previous Chapter<") && !html.contains(">Next Chapter<")
                 })
-                .map(|html| convert_to_format(html, &format))
+                .map(|html| custom_convert_to_format(html, &format, Some(Box::new(custom_convert))))
                 .collect();
             let date_posted = document
                 .find(predicate::Class("entry-date"))
@@ -158,152 +271,37 @@ pub fn get_story(runtime: &Runtime, format: TextFormat) -> Result<Story, Archive
                 .expect("Could not find chapter posted-on date")
                 .attr("datetime")
                 .expect("Could not find chapter posted-on date attr");
-            let id = {
-                let idx = title
-                    .find(" –")
-                    .unwrap_or_else(|| panic!("Did not find pattern in {}", title));
-                let pieces = title.split_at(idx);
-                let number = pieces
-                    .1
-                    .find(|c: char| c.is_ascii_digit())
-                    .unwrap_or_else(|| panic!("Did not find digit in {}", pieces.1));
-                let number = pieces.1.split_at(number).1;
-                let num_pieces = number.split_at(number.find('.').unwrap());
-                let (arc_num, chap_num) = (num_pieces.0, &num_pieces.1[1..]);
-                format!("katalepsis:{}:{}", arc_num, chap_num)
-            };
-            Ok(Content::Chapter {
-                id,
-                name: title,
-                description: None,
-                text: body_text,
-                url: page_plus_url.1,
-                date_posted: DateTime::parse_from_rfc3339(date_posted).unwrap_or_else(|_| {
-                    panic!(
-                        "Chapter posted-on date ({}) did not conform to rfc3339",
-                        date_posted
-                    )
-                }),
-            })
-        })
-        .map(|c: Result<_, ArchiveError>| c.unwrap())
-        .collect::<Vec<Content>>()
-        .into_iter()
-        .map(|chapter| {
-            let id = if let Content::Chapter { id, .. } = &chapter {
-                id
-            } else {
-                unreachable!()
-            };
-            let arc_num = &id[id.find(':').unwrap() + 1..id.rfind(':').unwrap()];
-            let arc_num = arc_num
-                .parse::<u8>()
-                .unwrap_or_else(|_| panic!("Arc number '{}' should be an int", arc_num));
-            (arc_num, chapter)
-        })
-        .fold(
-            BTreeMap::new(),
-            // Use (u16, String) tuple as key so order is maintained according to u16 value.
-            |mut acc: BTreeMap<(u8, String), Vec<Content>>, pair| {
-                let arc_num = pair.0;
-                let chapter = pair.1;
-                let arc_info = match chapter {
-                    Content::Chapter { ref name, .. } => {
-                        let idx = name
-                            .find(" –")
-                            .unwrap_or_else(|| panic!("Did not find pattern in {}", name));
-                        let chapter_name = name.split_at(idx).0.to_owned();
-                        (arc_num, format!("Arc {}: {}", arc_num, chapter_name))
-                    }
-                    _ => unreachable!("All Content at this point are Chapters"),
-                };
-                if acc.get(&arc_info).is_none() {
-                    let new_vec = Vec::new();
-                    acc.insert((arc_info.0, arc_info.1.clone()), new_vec);
-                }
-                acc.get_mut(&arc_info).unwrap().push(chapter);
-                acc
-            },
-        )
-        .into_iter()
-        .map(|((arc_num, arc_name), mut chapters)| {
-            chapters.sort_unstable_by(|chap1, chap2| match (chap1, chap2) {
-                (Content::Chapter { id: id1, .. }, Content::Chapter { id: id2, .. }) => {
-                    let chap1_id = &id1[id1.rfind(':').unwrap() + 1..];
-                    let chap1_id = chap1_id
-                        .parse::<u8>()
-                        .unwrap_or_else(|_| panic!("Arc number '{}' should be an int", chap1_id));
-                    let chap2_id = &id2[id2.rfind(':').unwrap() + 1..];
-                    let chap2_id = chap2_id
-                        .parse::<u8>()
-                        .unwrap_or_else(|_| panic!("Arc number '{}' should be an int", chap2_id));
-                    chap1_id.cmp(&chap2_id)
-                }
-                _ => unreachable!("All Section chapters are of type Chapter"),
+            let date_posted = DateTime::parse_from_rfc3339(date_posted).unwrap_or_else(|_| {
+                panic!(
+                    "Chapter posted-on date ({}) did not conform to rfc3339",
+                    date_posted
+                )
             });
-            Content::Section {
-                id: format!("katalepsis:{}", arc_num),
-                name: arc_name,
-                description: None,
-                chapters,
-                url: Some(format!("https://katalepsis.net/category/arc-{}/", arc_num)),
-            }
-        })
-        .collect();
-
-    let home_page = Document::from_read(
-        runtime
-            .block_on(async {
-                let intermediate = client.get("https://katalepsis.net/").send().await?;
-                intermediate.text().await
-            })?
-            .as_bytes(),
-    )?;
-
-    let description: String = home_page
-        .find(predicate::Class("entry-content").child(predicate::Name("p")))
-        .take(3)
-        .map(|elem| elem.inner_html())
-        .map(|html| convert_to_format(html, &format))
-        .collect();
-
-    Ok(Story {
-        name: "Katalepsis".to_owned(),
-        author: Author {
-            name: "HY".to_owned(),
-            id: "katalepsis:".to_owned(),
-        },
-        description: Some(description),
-        url: "https://katalepsis.net".to_owned(),
-        tags: Vec::new(),
-        chapters: sections,
-        source: StorySource::Katalepsis,
-    })
+            
+            chap.text = body_text;
+            chap.date_posted = date_posted;
+            Ok(())
+        });
+        let results = runtime.block_on(async { join_all(hydrate).await });
+        match results.into_iter().find(|res| res.is_err()) {
+            Some(err) => Err(err.unwrap_err()),
+            None => Ok(story),
+        }
+    }
 }
 
-fn convert_to_format(html: String, format: &TextFormat) -> String {
+fn custom_convert(formatted_text: String, format: &TextFormat) -> String {
     match format {
-        TextFormat::Html => html,
-        TextFormat::Markdown => {
-            let mut pandoc = pandoc::new();
-            pandoc
-                .set_input_format(InputFormat::Html, Vec::new())
-                .set_output_format(OutputFormat::MarkdownStrict, Vec::new())
-                .set_input(InputKind::Pipe(html.clone()))
-                .set_output(OutputKind::Pipe);
-            match pandoc.execute() {
-                Ok(PandocOutput::ToBuffer(text)) => match text.as_ref() {
-                    "==" => "<span align=\"center\">* * *</span>".to_owned(),
-                    _ => {
-                        if text.contains(">* * *<") {
-                            text.replace(">* * *<", " align=\"center\">* * *<")
-                        } else {
-                            text
-                        }
-                    }
-                },
-                _ => parse_html(html.as_str()),
+        TextFormat::Markdown => match formatted_text.as_ref() {
+            "==" => "<span align=\"center\">* * *</span>".to_owned(),
+            _ => {
+                if formatted_text.contains(">* * *<") {
+                    formatted_text.replace(">* * *<", " align=\"center\">* * *<")
+                } else {
+                    formatted_text
+                }
             }
-        }
+        },
+        _ => formatted_text,
     }
 }

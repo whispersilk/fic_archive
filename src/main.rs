@@ -2,7 +2,11 @@ use rusqlite::Connection;
 use tokio::runtime;
 
 use self::error::ArchiveError;
-use self::structs::{Content, StorySource, TextFormat};
+use self::parser::{
+    Parser,
+    katalepsis::KatalepsisParser
+};
+use self::structs::{StorySource, TextFormat};
 
 mod error;
 mod parser;
@@ -20,7 +24,8 @@ fn main() -> Result<(), ArchiveError> {
     let runtime = runtime::Runtime::new()?;
     let conn = Connection::open("/home/daniel/Documents/Code/fic_archive/test_db.db")?;
     let source = StorySource::from_url("https://www.royalroad.com/fiction/39408/beware-of-chicken");
-    //let source = StorySource::from_url("https://katalepsis.net");
+    let source = StorySource::from_url("https://www.fanfiction.net/s/3676590");
+    let source = StorySource::from_url("https://katalepsis.net");
 
     let existing_story = sql::get_story_by_id(&conn, &source.to_id())?;
     println!(
@@ -33,7 +38,11 @@ fn main() -> Result<(), ArchiveError> {
     );
 
     let story = match source {
-        StorySource::Katalepsis => parser::katalepsis::get_story(&runtime, TextFormat::Markdown)?,
+        StorySource::FFNet(_) => parser::ffnet::get_story(&runtime, TextFormat::Markdown, source)?,
+        StorySource::Katalepsis => {
+            let parser = KatalepsisParser {};
+            parser.get_story(&runtime, &TextFormat::Markdown, source)?
+        },
         StorySource::RoyalRoad(_) => {
             parser::royalroad::get_story(&runtime, TextFormat::Markdown, source)?
         }

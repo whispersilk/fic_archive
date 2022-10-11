@@ -1,7 +1,3 @@
-use html2md::parse_html;
-use pandoc::{InputFormat, InputKind, OutputFormat, OutputKind, PandocOutput};
-use select::predicate::Predicate;
-
 use chrono::DateTime;
 use futures::future::join_all;
 use rayon::prelude::{
@@ -9,12 +5,13 @@ use rayon::prelude::{
 };
 use regex::Regex;
 use reqwest::{Client, Response};
-use select::{document::Document, predicate};
+use select::{document::Document, predicate, predicate::Predicate};
 use tokio::runtime::Runtime;
 
 use crate::{
     error::ArchiveError,
-    structs::{Author, ChapterLink, Content, Story, StoryBase, StorySource, TextFormat},
+    parser::convert_to_format,
+    structs::{Author, Chapter, ChapterLink, Content, Story, StoryBase, StorySource, TextFormat},
 };
 
 static CHAPTER_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) =
@@ -107,7 +104,7 @@ pub fn get_story(
     for idx in 0..chapter_pages.len() {
         chapter_urls.push(chapter_pages.get(idx).unwrap().url().as_str().to_owned());
     }
-    let mut chapters: Vec<Content> = runtime
+    let mut chapters: Vec<Chapter> = runtime
         .block_on(async { join_all(chapter_pages.into_iter().map(|page| page.text())).await })
         .into_par_iter()
         .zip(chapter_urls) // Pair of (text, url)
@@ -134,7 +131,7 @@ pub fn get_story(
                 .expect("Could not find chapter posted-on date")
                 .attr("datetime")
                 .unwrap();
-            Ok(Content::Chapter {
+            Ok(Chapter {
                 id: format!(
                     "rr:{}:{}",
                     if let StorySource::RoyalRoad(ref id) = &source {
@@ -165,19 +162,7 @@ pub fn get_story(
         })
         .map(|c: Result<_, ArchiveError>| c.unwrap())
         .collect();
-    chapters.par_sort_unstable_by(|a, b| match (a, b) {
-        (
-            Content::Chapter {
-                date_posted: a_date,
-                ..
-            },
-            Content::Chapter {
-                date_posted: b_date,
-                ..
-            },
-        ) => a_date.cmp(b_date),
-        _ => unreachable!(),
-    });
+    chapters.par_sort_unstable_by(|a, b| a.date_posted.cmp(&b.date_posted));
 
     let description = main_page
         .find(
@@ -199,25 +184,7 @@ pub fn get_story(
         description: Some(description),
         url: source.to_url(),
         tags,
-        chapters,
+        chapters: chapters.into_iter().map(Content::Chapter).collect(),
         source,
     })
-}
-
-fn convert_to_format(html: String, format: &TextFormat) -> String {
-    match format {
-        TextFormat::Html => html,
-        TextFormat::Markdown => {
-            let mut pandoc = pandoc::new();
-            pandoc
-                .set_input_format(InputFormat::Html, Vec::new())
-                .set_output_format(OutputFormat::MarkdownStrict, Vec::new())
-                .set_input(InputKind::Pipe(html.clone()))
-                .set_output(OutputKind::Pipe);
-            match pandoc.execute() {
-                Ok(PandocOutput::ToBuffer(text)) => text,
-                _ => parse_html(html.as_str()),
-            }
-        }
-    }
 }

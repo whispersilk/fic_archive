@@ -1,9 +1,7 @@
 use crate::error::ArchiveError;
-use crate::Content;
+use crate::structs::{Chapter, Content, Section, Story};
 use chrono::DateTime;
 use rusqlite::{Connection, Error, Result};
-
-use crate::structs::Story;
 
 pub fn create_tables(conn: &Connection) -> Result<(), Error> {
     conn.execute(
@@ -69,7 +67,7 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
         stmt = conn.prepare(
             "SELECT id, name, description, url, parent_id FROM sections WHERE story_id = :story_id",
         )?;
-        let mut sections: Vec<(Option<String>, Content)> = stmt
+        let mut sections: Vec<(Option<String>, Section)> = stmt
             .query_map(&[(":story_id", id)], |row| {
                 let section_id = row.get::<usize, String>(4)?;
                 let section_id = match section_id.as_str() {
@@ -78,7 +76,7 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
                 };
                 Ok((
                     section_id,
-                    Content::Section {
+                    Section {
                         id: row.get(0)?,
                         name: row.get(1)?,
                         description: {
@@ -103,7 +101,7 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
             .collect();
 
         stmt = conn.prepare("SELECT id, name, description, text, url, date_posted, section_id FROM chapters WHERE story_id = :story_id")?;
-        let chapters: Vec<(Option<String>, Content)> = stmt
+        let chapters: Vec<(Option<String>, Chapter)> = stmt
             .query_map(&[(":story_id", id)], |row| {
                 let section_id = row.get::<usize, String>(6)?;
                 let section_id = match section_id.as_str() {
@@ -112,7 +110,7 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
                 };
                 Ok((
                     section_id,
-                    Content::Chapter {
+                    Chapter {
                         id: row.get(0)?,
                         name: row.get(1)?,
                         description: {
@@ -146,19 +144,17 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
                 .filter(|chap| chap.0.is_some())
                 .map(|chap| (chap.0.unwrap(), chap.1))
             {
-                let (parent_id, section) = sections
-                    .iter_mut()
-                    .find(|sec| sec.1.get_id() == chap.0)
-                    .expect(
+                let (parent_id, section) =
+                    sections.iter_mut().find(|sec| sec.1.id == chap.0).expect(
                         format!(
                             "Chapter with id {} points to non-existent section with id {}",
-                            chap.1.get_id(),
-                            chap.0
+                            chap.1.id, chap.0
                         )
                         .as_str(),
                     );
-                assert!(matches!(section, Content::Section { .. }));
-                section.chapters.push(chap.1);
+                assert!(matches!(section, Section { .. }));
+
+                //section.chapters.push(chap.1);
             }
         }
         // let chapters =
@@ -195,13 +191,13 @@ fn save_content(
     parent_id: Option<&str>,
 ) -> Result<(), ArchiveError> {
     match content {
-        Content::Section {
+        Content::Section(Section {
             id,
             name,
             description,
             chapters,
             url,
-        } => {
+        }) => {
             conn.execute("INSERT INTO sections (id, name, description, url, story_id, parent_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
 				(
 					id,
@@ -216,14 +212,14 @@ fn save_content(
                 save_content(conn, inner, story_id, Some(id))?;
             }
         }
-        Content::Chapter {
+        Content::Chapter(Chapter {
             id,
             name,
             description,
             text,
             url,
             date_posted,
-        } => {
+        }) => {
             conn.execute("INSERT INTO chapters (id, name, description, text, url, date_posted, story_id, section_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
 				(
 					id,
