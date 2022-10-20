@@ -9,7 +9,6 @@ use crate::{
 };
 
 pub mod ao3;
-pub mod ffnet;
 pub mod katalepsis;
 pub mod royalroad;
 

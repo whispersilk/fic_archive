@@ -105,7 +105,6 @@ pub enum TextFormat {
 #[derive(Debug, Clone)]
 pub enum StorySource {
     AO3(String),
-    FFNet(String),
     Katalepsis,
     RoyalRoad(String),
 }
@@ -141,7 +140,6 @@ impl StorySource {
                 );
                 match *name {
                     "ao3" => StorySource::AO3(require_story_source_id(id, maybe_error)),
-                    "ffnet" => StorySource::FFNet(require_story_source_id(id, maybe_error)),
                     "katalepsis" => StorySource::Katalepsis,
                     "rr" => StorySource::RoyalRoad(require_story_source_id(id, maybe_error)),
                     _ => panic!("No way to convert source {name} to a StorySource"),
@@ -153,7 +151,6 @@ impl StorySource {
     pub fn to_id(&self) -> String {
         match self {
             StorySource::AO3(ref id) => format!("ao3:{}", id),
-            StorySource::FFNet(ref id) => format!("ffnet:{}", id),
             StorySource::Katalepsis => "katalepsis".to_owned(),
             StorySource::RoyalRoad(ref id) => format!("rr:{}", id),
         }
@@ -164,7 +161,6 @@ impl StorySource {
             StorySource::AO3(id) => {
                 format!("https://archiveofourown.org/works/{}", id)
             }
-            StorySource::FFNet(id) => format!("https://www.fanfiction.net/s/{}", id),
             StorySource::Katalepsis => "https://katalepsis.net".to_owned(),
             StorySource::RoyalRoad(id) => format!("https://www.royalroad.com/fiction/{}", id),
         }

@@ -35,8 +35,6 @@ fn main() -> Result<(), ArchiveError> {
         StorySource::AO3(_) => &AO3Parser {},
         StorySource::Katalepsis => &KatalepsisParser {},
         StorySource::RoyalRoad(_) => &RoyalRoadParser {},
-        // StorySource::FFNet(_) => parser::ffnet::get_story(&runtime, TextFormat::Markdown, source)?,
-        StorySource::FFNet(_) => unreachable!(),
     };
     let story = parser.get_story(&runtime, &TextFormat::Markdown, source)?;
 
