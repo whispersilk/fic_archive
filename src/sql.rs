@@ -1,7 +1,9 @@
-use crate::error::ArchiveError;
-use crate::structs::{Chapter, Content, Section, Story};
 use chrono::DateTime;
+use rayon::prelude::ParallelSliceMut;
 use rusqlite::{Connection, Error, Result};
+
+use crate::error::ArchiveError;
+use crate::structs::{Author, Chapter, ChapterText, Content, Section, Story, StorySource};
 
 pub fn create_tables(conn: &Connection) -> Result<(), Error> {
     conn.execute(
@@ -45,7 +47,20 @@ pub fn create_tables(conn: &Connection) -> Result<(), Error> {
 		)",
         (),
     )?;
-    // We don't yet have a "Tags" table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tags (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        )",
+        (),
+    )?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS tag_uses (
+            tag_id TEXT NOT NULL REFERENCES tags(id),
+            story_id TEXT NOT NULL REFERENCES stories(id)
+        )",
+        (),
+    )?;
     Ok(())
 }
 
@@ -53,14 +68,12 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
     create_tables(conn)?;
     let mut stmt = conn.prepare("SELECT COUNT(1) FROM stories WHERE id = :id")?;
     let story_exists = stmt
-        .query_map(&[(":id", id)], |row| match row.get(0) {
+        .query_row(&[(":id", id)], |row| match row.get(0) {
             Ok(0) => Ok(None),
             Ok(1) => Ok(Some(())),
             _ => Ok(None),
-        })
-        .unwrap()
-        .next()
-        .is_some();
+        });
+    let story_exists = story_exists.is_ok() && story_exists.unwrap().is_some();
     if !story_exists {
         Ok(None)
     } else {
@@ -101,13 +114,14 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
             .collect();
 
         stmt = conn.prepare("SELECT id, name, description, text, url, date_posted, section_id FROM chapters WHERE story_id = :story_id")?;
-        let chapters: Vec<(Option<String>, Chapter)> = stmt
+        let mut chapters: Vec<(Option<String>, Chapter)> = stmt
             .query_map(&[(":story_id", id)], |row| {
                 let section_id = row.get::<usize, String>(6)?;
                 let section_id = match section_id.as_str() {
                     "NULL" => None,
                     _ => Some(section_id),
                 };
+
                 Ok((
                     section_id,
                     Chapter {
@@ -120,12 +134,11 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
                                 _ => Some(desc),
                             }
                         },
-                        text: row.get(3)?,
+                        text: ChapterText::Hydrated(row.get(3)?),
                         url: row.get(4)?,
-                        date_posted: DateTime::parse_from_rfc3339({
-                            let s: String = row.get(5)?;
-                            s.clone().as_str()
-                        })
+                        date_posted: DateTime::parse_from_rfc3339(
+                            row.get::<usize, String>(5)?.as_str(),
+                        )
                         .unwrap_or_else(|_| {
                             panic!(
                                 "Chapter posted-on date ({:?}) did not conform to rfc3339",
@@ -138,34 +151,98 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
             .map(|chap| chap.unwrap())
             .collect();
 
-        if !sections.is_empty() {
-            for chap in chapters
-                .into_iter()
-                .filter(|chap| chap.0.is_some())
-                .map(|chap| (chap.0.unwrap(), chap.1))
-            {
-                let (parent_id, section) =
-                    sections.iter_mut().find(|sec| sec.1.id == chap.0).expect(
-                        format!(
-                            "Chapter with id {} points to non-existent section with id {}",
-                            chap.1.id, chap.0
-                        )
-                        .as_str(),
-                    );
-                assert!(matches!(section, Section { .. }));
-
-                //section.chapters.push(chap.1);
+        if !chapters.is_empty() {
+            for idx in (0..chapters.len() - 1).rev() {
+                if chapters[idx].0.is_some() {
+                    let (parent_id, chapter) = chapters.remove(idx);
+                    let parent_id = parent_id.unwrap();
+                    if let Some((_, section)) = sections.iter_mut().find(|(_, s)| s.id == parent_id)
+                    {
+                        section.chapters.push(Content::Chapter(chapter));
+                    } else {
+                        panic!(
+                            "Chapter {} has section_id {} that does not match any section",
+                            chapter.id, parent_id
+                        );
+                    }
+                }
             }
         }
-        // let chapters =
-        Ok(None)
+        if !sections.is_empty() {
+            for idx in (0..sections.len() - 1).rev() {
+                sections[idx]
+                    .1
+                    .chapters
+                    .par_sort_unstable_by(|a, b| a.id().cmp(b.id()));
+                if sections[idx].0.is_some() {
+                    let (parent_id, section) = sections.remove(idx);
+                    let parent_id = parent_id.unwrap();
+                    if let Some((_, parent)) = sections.iter_mut().find(|(_, s)| s.id == parent_id)
+                    {
+                        parent.chapters.push(Content::Section(section));
+                    }
+                }
+            }
+        }
+        let mut story_chapters: Vec<Content> = sections
+            .into_iter()
+            .map(|(_, section)| Content::Section(section))
+            .chain(
+                chapters
+                    .into_iter()
+                    .map(|(_, chapter)| Content::Chapter(chapter)),
+            )
+            .collect();
+        story_chapters.par_sort_unstable_by(|a, b| a.id().cmp(b.id()));
+
+        stmt = conn.prepare(
+            "SELECT
+                tags.name
+            FROM tag_uses INNER JOIN tags
+            ON tags.id = tag_uses.tag_id
+            WHERE tag_uses.story_id = :story_id",
+        )?;
+        let story_tags: Vec<String> = stmt
+            .query_map(&[(":story_id", id)], |row| row.get::<usize, String>(0))?
+            .filter(|res| res.is_ok())
+            .map(|res| res.unwrap())
+            .collect();
+
+        stmt = conn.prepare(
+            "SELECT
+                stories.name,
+                stories.description,
+                stories.url,
+                stories.author_id,
+                authors.name
+            FROM stories INNER JOIN authors
+            ON stories.author_id = authors.id
+            WHERE stories.id = :story_id",
+        )?;
+        stmt
+            .query_row(&[(":story_id", id)], |row| {
+                Ok(Story {
+                    name: row.get(0)?,
+                    description: row.get(1)?,
+                    url: row.get(2)?,
+                    author: Author {
+                        id: row.get(3)?,
+                        name: row.get(4)?,
+                    },
+                    chapters: story_chapters,
+                    tags: story_tags,
+                    source: StorySource::from_url(row.get::<usize, String>(2)?.as_str()),
+                })
+            })
+            .map(|story| Some(story))
+            .map_err(|err| err.into())
     }
 }
 
 pub fn save_story(conn: &Connection, story: &Story) -> Result<(), ArchiveError> {
     create_tables(conn)?;
     conn.execute(
-        "INSERT INTO authors (id, name) VALUES (?1, ?2)",
+        "INSERT OR IGNORE INTO authors (id, name) VALUES (?1, ?2)",
         (&story.author.id, &story.author.name),
     )?;
     conn.execute(
@@ -180,6 +257,17 @@ pub fn save_story(conn: &Connection, story: &Story) -> Result<(), ArchiveError> 
     )?;
     for content in story.chapters.iter().as_ref() {
         save_content(conn, content, &story.source.to_id(), None)?;
+    }
+    for tag in story.tags.iter().as_ref() {
+        let tag_id = tag.to_lowercase();
+        conn.execute(
+            "INSERT OR IGNORE INTO tags (id, name) VALUES (?1, ?2)",
+            (&tag_id, &tag),
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO tag_uses (tag_id, story_id) VALUES (?1, ?2)",
+            (&tag_id, &story.source.to_id()),
+        )?;
     }
     Ok(())
 }
@@ -225,7 +313,7 @@ fn save_content(
 					id,
 					name,
 					some_or_null(description),
-					text,
+					text.as_str(),
 					url,
 					&date_posted.to_rfc3339(),
 					story_id,
@@ -245,32 +333,3 @@ fn some_or_null(optstr: &Option<String>) -> &str {
         optstr.as_ref().unwrap()
     }
 }
-
-/*
-
-Tables:
-
-CREATE TABLE IF NOT EXISTS authors (
-    id: VARCHAR(64) PRIMARY KEY,
-    name: TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS stories {
-    id VARCHAR(64) NOT NULL PRIMARY KEY,
-    name TEXT NOT NULL,
-    author_id VARCHAR(64) NOT NULL REFERENCES authors(id),
-};
-
-CREATE TABLE IF NOT EXISTS sections {
-    id VARCHAR(64),
-    story_id
-};
-
-CREATE TABLE IF NOT EXISTS chapters {
-    id VARCHAR(64) PRIMARY KEY,
-    story_id VARCHAR(64) NOT NUMM REFERENCES stories(id),
-    section_id VARCHAR(64) REFERENCES sections(id),
-    name TEXT
-};\
-
-*/

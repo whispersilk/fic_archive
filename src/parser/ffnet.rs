@@ -14,7 +14,10 @@ use tokio::runtime::Runtime;
 use crate::{
     error::ArchiveError,
     parser::convert_to_format,
-    structs::{Author, Chapter, ChapterLink, Content, Story, StoryBase, StorySource, TextFormat},
+    structs::{
+        Author, Chapter, ChapterLink, ChapterText, Content, Story, StoryBase, StorySource,
+        TextFormat,
+    },
 };
 
 static CHAPTER_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) =
@@ -32,12 +35,11 @@ pub fn get_chapter_list(document: &Document, id: &str) -> Result<StoryBase, Arch
         .to_owned();
     let author = document
         .find(predicate::Attr("id", "profile_top").child(predicate::Attr("href", ())))
-        .filter(|node| {
+        .find(|node| {
             node.attr("href")
                 .expect("Author should have a profile link")
                 .starts_with("/u/")
         })
-        .next()
         .expect("Could not find author element");
     let author = Author {
         name: author.text().trim().to_owned(),
@@ -45,7 +47,7 @@ pub fn get_chapter_list(document: &Document, id: &str) -> Result<StoryBase, Arch
             let profile_url = author
                 .attr("href")
                 .expect("Author should have a profile link");
-            &profile_url[3..profile_url.rfind("/").unwrap()]
+            &profile_url[3..profile_url.rfind('/').unwrap()]
         }),
     };
     let mut pages: Vec<ChapterLink> = document
@@ -89,7 +91,7 @@ pub fn get_story(
             intermediate.text().await
         })?;
         println!("{:?}", page_bytes);
-        page_bytes.clone().as_bytes()
+        page_bytes.clone().as_bytes() // remove clone when we remove println
     })?;
     let chapter_listing = get_chapter_list(&main_page, &source.to_id())?;
 
@@ -147,10 +149,7 @@ pub fn get_story(
                 .unwrap();
             let date_posted = FixedOffset::east(0)
                 .datetime_from_str(date_posted, "%s")
-                .expect(&format!(
-                    "Could not convert timestamp {} to date.",
-                    date_posted
-                ));
+                .unwrap_or_else(|_| panic!("Could not convert timestamp {} to date.", date_posted));
             Ok(Chapter {
                 id: format!(
                     "ffnet:{}:{}",
@@ -170,7 +169,7 @@ pub fn get_story(
                 ),
                 name: title,
                 description: None,
-                text: body_text,
+                text: ChapterText::Hydrated(body_text),
                 url: page_plus_url.1,
                 date_posted,
             })

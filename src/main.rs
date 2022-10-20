@@ -3,8 +3,7 @@ use tokio::runtime;
 
 use self::error::ArchiveError;
 use self::parser::{
-    Parser,
-    katalepsis::KatalepsisParser
+    ao3::AO3Parser, katalepsis::KatalepsisParser, royalroad::RoyalRoadParser, Parser,
 };
 use self::structs::{StorySource, TextFormat};
 
@@ -23,30 +22,23 @@ fn main() -> Result<(), ArchiveError> {
 
     let runtime = runtime::Runtime::new()?;
     let conn = Connection::open("/home/daniel/Documents/Code/fic_archive/test_db.db")?;
-    let source = StorySource::from_url("https://www.royalroad.com/fiction/39408/beware-of-chicken");
-    let source = StorySource::from_url("https://www.fanfiction.net/s/3676590");
-    let source = StorySource::from_url("https://katalepsis.net");
+    // let source = StorySource::from_url("https://www.royalroad.com/fiction/39408/beware-of-chicken");
+    // let source = StorySource::from_url("https://www.fanfiction.net/s/3676590");
+    // let source = StorySource::from_url("https://katalepsis.net");
+    // let source = StorySource::from_url("https://www.royalroad.com/fiction/59450/bioshifter");
+    let source = StorySource::from_url("https://www.royalroad.com/fiction/40373/vigor-mortis");
+    // let source = StorySource::from_url("https://archiveofourown.org/works/35394595");
 
     let existing_story = sql::get_story_by_id(&conn, &source.to_id())?;
-    println!(
-        "Existing story is: {}",
-        if existing_story.is_none() {
-            "NONE"
-        } else {
-            "SOME"
-        }
-    );
 
-    let story = match source {
-        StorySource::FFNet(_) => parser::ffnet::get_story(&runtime, TextFormat::Markdown, source)?,
-        StorySource::Katalepsis => {
-            let parser = KatalepsisParser {};
-            parser.get_story(&runtime, &TextFormat::Markdown, source)?
-        },
-        StorySource::RoyalRoad(_) => {
-            parser::royalroad::get_story(&runtime, TextFormat::Markdown, source)?
-        }
+    let parser: &dyn Parser =  match source {
+        StorySource::AO3(_) => &AO3Parser {},
+        StorySource::Katalepsis => &KatalepsisParser {},
+        StorySource::RoyalRoad(_) => &RoyalRoadParser {},
+        // StorySource::FFNet(_) => parser::ffnet::get_story(&runtime, TextFormat::Markdown, source)?,
+        StorySource::FFNet(_) => unreachable!(),
     };
+    let story = parser.get_story(&runtime, &TextFormat::Markdown, source)?;
 
     if existing_story.is_none() {
         sql::save_story(&conn, &story)?;
@@ -54,41 +46,6 @@ fn main() -> Result<(), ArchiveError> {
     } else {
         println!("Not saving story because it already exists!");
     }
-
-    // let mut in_order = Vec::new();
-    // story.chapters
-    //     .into_iter()
-    //     .for_each(|s| {
-    //         if let Content::Section { name, chapters, .. } = s {
-    //             in_order.push(name.clone());
-    //             chapters.iter().for_each(|c| if let Content::Chapter { name, .. } = c { in_order.push(format!("    {}", name)) } else {  });
-    //         } else { unreachable!() }
-    //     });
-    // for i in 0..in_order.len() {
-    //     println!("{}", in_order[i]);
-    // }
-
-    // if let Content::Section { chapters, .. } = &story.chapters[0] {
-    //     if let Content::Chapter { text, .. } = &chapters[0] {
-    //         println!("{}", text);
-    //     }
-    // }
-
-    // if let Content::Chapter { text, .. } = &story.chapters[0] {
-    //     println!("{}", text);
-    // }
-
-    /*for chapter in story.chapters.iter() {
-        match chapter {
-            Content::Section {
-                name,
-                description: _,
-                chapters,
-                url: _,
-            } => println!("{} ({} chapters)", name, chapters.len()),
-            _ => (),
-        }
-    }*/
 
     Ok(())
 }

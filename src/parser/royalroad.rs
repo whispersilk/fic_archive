@@ -1,190 +1,213 @@
 use chrono::DateTime;
 use futures::future::join_all;
-use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
-};
 use regex::Regex;
-use reqwest::{Client, Response};
+use reqwest::Client;
 use select::{document::Document, predicate, predicate::Predicate};
 use tokio::runtime::Runtime;
 
 use crate::{
     error::ArchiveError,
-    parser::convert_to_format,
-    structs::{Author, Chapter, ChapterLink, Content, Story, StoryBase, StorySource, TextFormat},
+    parser::{convert_to_format, Parser},
+    structs::{Author, Chapter, ChapterText, Content, Story, StorySource, TextFormat},
 };
 
 static CHAPTER_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) =
     (r"/chapter/(\d+)", once_cell::sync::OnceCell::new());
 
-pub fn get_chapter_list(document: &Document) -> Result<StoryBase, ArchiveError> {
-    let pages = document
-        .find(
-            predicate::Attr("id", "chapters")
-                .child(predicate::Name("tbody"))
-                .descendant(predicate::Name("a")),
-        )
-        .filter(|node| node.attr("data-content") == None)
-        .inspect(|x| println!("node is: {:?}", x))
-        .map(|link| ChapterLink {
-            url: format!(
-                "https://www.royalroad.com{}",
-                link.attr("href")
-                    .expect("A link in the ToC had no href")
-                    .to_owned()
-            ),
-            title: link.text().trim().to_owned(),
-        })
-        .collect();
-    let title = document
-        .find(predicate::Class("fic-title").descendant(predicate::Name("h1")))
-        .next()
-        .expect("Could not find story title")
-        .text();
-    let author = document
-        .find(
-            predicate::Class("fic-title")
-                .descendant(predicate::Attr("property", "author").descendant(predicate::Name("a"))),
-        )
-        .next()
-        .expect("Cannot find author name");
-    let author = Author {
-        name: author.text().trim().to_owned(),
-        id: format!(
-            "rr:{}",
-            author
-                .attr("href")
-                .expect("Author should have a profile link")
-                .replace("/profile/", "")
-        ),
-    };
+pub(crate) struct RoyalRoadParser;
 
-    Ok(StoryBase {
-        title,
-        author,
-        chapter_links: pages,
-    })
-}
+impl Parser for RoyalRoadParser {
+    fn get_skeleton(
+        &self,
+        runtime: &Runtime,
+        client: &Client,
+        format: &TextFormat,
+        source: StorySource,
+    ) -> Result<Story, ArchiveError> {
+        let main_page = Document::from_read(
+            runtime
+                .block_on(async {
+                    let intermediate = client.get(&source.to_url()).send().await?;
+                    intermediate.text().await
+                })?
+                .as_bytes(),
+        )?;
+        let chapters = main_page
+            .find(
+                predicate::Attr("id", "chapters")
+                    .child(predicate::Name("tbody"))
+                    .child(predicate::Name("tr")),
+            )
+            .map(|row| {
+                let content_a = row
+                    .children()
+                    .filter(|c| c.is(predicate::Name("td")))
+                    .filter(|c| c.attr("data-content").is_some())
+                    .map(|tr| {
+                        tr.children()
+                            .find(|c| c.is(predicate::Name("a")))
+                            .expect("Should have a node with chapter post time")
+                    })
+                    .next()
+                    .expect("Should have a td with data-content");
 
-pub fn get_story(
-    runtime: &Runtime,
-    format: TextFormat,
-    source: StorySource,
-) -> Result<Story, ArchiveError> {
-    let client = Client::new();
-
-    let main_page = Document::from_read(
-        runtime
-            .block_on(async {
-                let intermediate = client.get(&source.to_url()).send().await?;
-                intermediate.text().await
-            })?
-            .as_bytes(),
-    )?;
-    let chapter_listing = get_chapter_list(&main_page)?;
-
-    let pages = chapter_listing
-        .chapter_links
-        .into_iter()
-        .map(|chapter| chapter.url)
-        .map(|href| client.get(href).send());
-    let mut chapter_pages = runtime.block_on(async { join_all(pages).await });
-    for idx in 0..chapter_pages.len() {
-        let elem = chapter_pages.get(idx).unwrap();
-        if elem.is_err() {
-            let err = chapter_pages.remove(idx).unwrap_err();
-            return Err(ArchiveError::Request(err));
-        }
-    }
-    let mut chapter_urls: Vec<String> = Vec::with_capacity(chapter_pages.len());
-    let chapter_pages: Vec<Response> = chapter_pages
-        .into_iter()
-        .map(|page| page.unwrap())
-        .collect();
-    for idx in 0..chapter_pages.len() {
-        chapter_urls.push(chapter_pages.get(idx).unwrap().url().as_str().to_owned());
-    }
-    let mut chapters: Vec<Chapter> = runtime
-        .block_on(async { join_all(chapter_pages.into_iter().map(|page| page.text())).await })
-        .into_par_iter()
-        .zip(chapter_urls) // Pair of (text, url)
-        .map(|page_plus_url| {
-            let document = Document::from_read(page_plus_url.0?.as_bytes())?;
-            let title = document
-                .find(predicate::Class("fic-header").descendant(predicate::Name("h1")))
-                .next()
-                .expect("Chapter does not have title")
-                .text();
-            let body_text: String = document
-                .find(predicate::Class("chapter-content").child(predicate::Name("p")))
-                .map(|elem| elem.html())
-                .map(|html| convert_to_format(html, &format))
-                .collect();
-            let date_posted = document
-                .find(predicate::Class("fa-calendar"))
-                .next()
-                .expect("Could not find chapter posted-on date")
-                .parent()
-                .unwrap()
-                .children()
-                .find(|node| node.attr("datetime").is_some())
-                .expect("Could not find chapter posted-on date")
-                .attr("datetime")
-                .unwrap();
-            Ok(Chapter {
-                id: format!(
-                    "rr:{}:{}",
-                    if let StorySource::RoyalRoad(ref id) = &source {
-                        id
-                    } else {
-                        unreachable!()
-                    },
-                    CHAPTER_REGEX
-                        .1
-                        .get_or_init(|| Regex::new(CHAPTER_REGEX.0).unwrap())
-                        .captures(&page_plus_url.1)
-                        .unwrap()
-                        .get(1)
-                        .expect("Chapter url must contain id")
-                        .as_str()
-                ),
-                name: title,
-                description: None,
-                text: body_text,
-                url: page_plus_url.1,
-                date_posted: DateTime::parse_from_rfc3339(date_posted).unwrap_or_else(|_| {
+                let name = row
+                    .children()
+                    .filter(|c| c.is(predicate::Name("td")))
+                    .filter(|c| c.attr("data-content").is_none())
+                    .map(|tr| {
+                        tr.children()
+                            .find(|c| c.is(predicate::Name("a")))
+                            .expect("Should have a node with chapter link")
+                            .text()
+                            .trim()
+                            .to_owned()
+                    })
+                    .next()
+                    .expect("Should have a td without data-content");
+                let url = format!(
+                    "https://www.royalroad.com{}",
+                    content_a
+                        .attr("href")
+                        .expect("A link in the ToC had no href")
+                        .to_owned()
+                );
+                let time_string = content_a
+                    .children()
+                    .filter(|c| c.is(predicate::Name("time")))
+                    .map(|c| {
+                        c.attr("datetime")
+                            .expect("time tag should have datetime attr")
+                    })
+                    .next()
+                    .expect("Chapter content tag should have <time> child");
+                let date_posted = DateTime::parse_from_rfc3339(time_string).unwrap_or_else(|_| {
                     panic!(
                         "Chapter posted-on date ({}) did not conform to rfc3339",
-                        date_posted
+                        time_string
                     )
-                }),
+                });
+
+                Content::Chapter(Chapter {
+                    id: format!(
+                        "{}:{}",
+                        source.to_id(),
+                        CHAPTER_REGEX
+                            .1
+                            .get_or_init(|| Regex::new(CHAPTER_REGEX.0).unwrap())
+                            .captures(&url)
+                            .unwrap()
+                            .get(1)
+                            .expect("Chapter url must contain id")
+                            .as_str()
+                    ),
+                    name,
+                    description: None,
+                    text: ChapterText::Dehydrated,
+                    url,
+                    date_posted,
+                })
             })
+            .collect();
+        let title = main_page
+            .find(predicate::Class("fic-title").descendant(predicate::Name("h1")))
+            .next()
+            .expect("Could not find story title")
+            .text();
+        let author =
+            main_page
+                .find(predicate::Class("fic-title").descendant(
+                    predicate::Attr("property", "author").descendant(predicate::Name("a")),
+                ))
+                .next()
+                .expect("Cannot find author name");
+        let author = Author {
+            name: author.text().trim().to_owned(),
+            id: format!(
+                "rr:{}",
+                author
+                    .attr("href")
+                    .expect("Author should have a profile link")
+                    .replace("/profile/", "")
+            ),
+        };
+        let description = main_page
+            .find(
+                predicate::Class("hidden-content")
+                    .and(predicate::Attr("property", "description"))
+                    .child(predicate::Name("p")),
+            )
+            .map(|elem| elem.inner_html())
+            .collect();
+        let description = convert_to_format(description, format);
+
+        Ok(Story {
+            name: title,
+            author,
+            description: Some(description),
+            url: source.to_url(),
+            tags: Vec::new(),
+            chapters,
+            source,
         })
-        .map(|c: Result<_, ArchiveError>| c.unwrap())
-        .collect();
-    chapters.par_sort_unstable_by(|a, b| a.date_posted.cmp(&b.date_posted));
+    }
 
-    let description = main_page
-        .find(
-            predicate::Class("hidden-content")
-                .and(predicate::Attr("property", "description"))
-                .child(predicate::Name("p")),
-        )
-        .map(|elem| elem.inner_html())
-        .map(|html| convert_to_format(html, &format))
-        .collect();
-    let tags = main_page
-        .find(predicate::Class("tags").child(predicate::Name("a")))
-        .map(|elem| elem.text())
-        .collect();
+    fn fill_skeleton(
+        &self,
+        runtime: &Runtime,
+        client: &Client,
+        format: &TextFormat,
+        mut skeleton: Story,
+    ) -> Result<Story, ArchiveError> {
+        let hydrate = skeleton
+            .chapters
+            .iter_mut()
+            .filter_map(|con| match con {
+                Content::Section(_) => None,
+                Content::Chapter(c) => Some(c),
+            })
+            .map(|chapter| async {
+                let page = client.get(&chapter.url).send().await?.text().await?;
+                Ok((chapter, page))
+            });
 
-    Ok(Story {
-        name: chapter_listing.title,
-        author: chapter_listing.author,
-        description: Some(description),
-        url: source.to_url(),
-        tags,
-        chapters: chapters.into_iter().map(Content::Chapter).collect(),
-        source,
-    })
+        let results = runtime.block_on(async { join_all(hydrate).await });
+        if results
+            .iter()
+            .any(|res: &Result<(_, _), ArchiveError>| res.is_err())
+        {
+            return Err(ArchiveError::Internal("Oopsie!".to_owned()));
+        }
+
+        let mut results: Vec<(&mut Chapter, String)> =
+            results.into_iter().map(|r| r.unwrap()).collect();
+        rayon::scope(|s| {
+            for (chapter, page) in results.iter_mut() {
+                s.spawn(|_| {
+                    let document = Document::from_read(page.as_bytes())
+                        .expect("Couldn't read page to a document");
+                    let body_text: String = convert_to_format(
+                        document
+                            .find(predicate::Class("chapter-content").child(predicate::Name("p")))
+                            .map(|elem| elem.html())
+                            .collect(),
+                        format,
+                    );
+                    chapter.text = ChapterText::Hydrated(body_text);
+                });
+            }
+        });
+        Ok(skeleton)
+    }
+
+    fn get_story(
+        &self,
+        runtime: &Runtime,
+        format: &TextFormat,
+        source: StorySource,
+    ) -> Result<Story, ArchiveError> {
+        let client = Client::new();
+        let story = self.get_skeleton(runtime, &client, format, source)?;
+        self.fill_skeleton(runtime, &client, format, story)
+    }
 }

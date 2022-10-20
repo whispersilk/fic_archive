@@ -28,6 +28,15 @@ pub enum Content {
     Chapter(Chapter),
 }
 
+impl Content {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Chapter(c) => &c.id,
+            Self::Section(s) => &s.id,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Section {
     pub id: String,
@@ -51,9 +60,24 @@ pub struct Chapter {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
-    pub text: String,
+    pub text: ChapterText,
     pub url: String,
     pub date_posted: DateTime<FixedOffset>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChapterText {
+    Hydrated(String),
+    Dehydrated,
+}
+
+impl ChapterText {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Hydrated(s) => s,
+            Self::Dehydrated => "",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +104,7 @@ pub enum TextFormat {
 
 #[derive(Debug, Clone)]
 pub enum StorySource {
+    AO3(String),
     FFNet(String),
     Katalepsis,
     RoyalRoad(String),
@@ -91,14 +116,15 @@ impl StorySource {
     pub fn from_url(url: &str) -> StorySource {
         let regex_map = REGEXES.get_or_init(|| {
             vec![
+                ("ao3", r"^https://archiveofourown.org/works/(?P<id>\d+)/?.*"),
                 (
                     "ffnet",
-                    r"^https?://(?:www)?\.fanfiction\.net/s/(?P<id>\d+)/?\.*",
+                    r"^https?://(?:www)?\.fanfiction\.net/s/(?P<id>\d+)/?.*",
                 ),
                 ("katalepsis", r"^https?://katalepsis\.net/?.*"),
                 (
                     "rr",
-                    r"^https?://(?:www)?\.royalroad\.com/fiction/(?P<id>\d+)/?\.*",
+                    r"^https?://(?:www)?\.royalroad\.com/fiction/(?P<id>\d+)/?.*",
                 ),
             ]
             .into_iter()
@@ -108,23 +134,25 @@ impl StorySource {
         regex_map
             .iter()
             .find(|(_, regex)| regex.is_match(url))
-            .and_then(|(name, regex)| {
+            .map(|(name, regex)| {
                 let id = regex.captures(url).unwrap().name("id");
                 let maybe_error = &format!(
                     "Url {url} maps to source {name} and must contain a story ID, but does not"
                 );
-                Some(match *name {
+                match *name {
+                    "ao3" => StorySource::AO3(require_story_source_id(id, maybe_error)),
                     "ffnet" => StorySource::FFNet(require_story_source_id(id, maybe_error)),
                     "katalepsis" => StorySource::Katalepsis,
                     "rr" => StorySource::RoyalRoad(require_story_source_id(id, maybe_error)),
                     _ => panic!("No way to convert source {name} to a StorySource"),
-                })
+                }
             })
             .unwrap() // At this point we know we have a Some() - we'd have panicked otherwise
     }
 
     pub fn to_id(&self) -> String {
         match self {
+            StorySource::AO3(ref id) => format!("ao3:{}", id),
             StorySource::FFNet(ref id) => format!("ffnet:{}", id),
             StorySource::Katalepsis => "katalepsis".to_owned(),
             StorySource::RoyalRoad(ref id) => format!("rr:{}", id),
@@ -133,8 +161,11 @@ impl StorySource {
 
     pub fn to_url(&self) -> String {
         match self {
+            StorySource::AO3(id) => {
+                format!("https://archiveofourown.org/works/{}", id)
+            }
             StorySource::FFNet(id) => format!("https://www.fanfiction.net/s/{}", id),
-            StorySource::Katalepsis => "https://katalepsis.net/table-of-contents".to_owned(),
+            StorySource::Katalepsis => "https://katalepsis.net".to_owned(),
             StorySource::RoyalRoad(id) => format!("https://www.royalroad.com/fiction/{}", id),
         }
     }

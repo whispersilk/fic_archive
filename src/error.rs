@@ -2,6 +2,7 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum ArchiveError {
+    Internal(String),
     Io(std::io::Error),
     Request(reqwest::Error),
     Database(rusqlite::Error),
@@ -11,6 +12,7 @@ pub enum ArchiveError {
 impl fmt::Display for ArchiveError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
+            ArchiveError::Internal(ref s) => write!(f, "Internal error: {}", s),
             ArchiveError::Io(ref err) => err.fmt(f),
             ArchiveError::Request(ref err) => err.fmt(f),
             ArchiveError::Database(ref err) => err.fmt(f),

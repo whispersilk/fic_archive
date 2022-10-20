@@ -8,6 +8,7 @@ use crate::{
     structs::{Story, StorySource, TextFormat},
 };
 
+pub mod ao3;
 pub mod ffnet;
 pub mod katalepsis;
 pub mod royalroad;
@@ -19,6 +20,13 @@ pub trait Parser {
         client: &Client,
         format: &TextFormat,
         source: StorySource,
+    ) -> Result<Story, ArchiveError>;
+    fn fill_skeleton(
+        &self,
+        runtime: &Runtime,
+        client: &Client,
+        format: &TextFormat,
+        skeleton: Story,
     ) -> Result<Story, ArchiveError>;
     fn get_story(
         &self,
