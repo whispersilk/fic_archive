@@ -2,6 +2,11 @@ use chrono::{DateTime, FixedOffset};
 use once_cell::sync::OnceCell;
 use regex::{Match, Regex};
 
+use crate::error::ArchiveError;
+use crate::parser::{
+    ao3::AO3Parser, katalepsis::KatalepsisParser, royalroad::RoyalRoadParser, Parser,
+};
+
 #[derive(Debug, Clone)]
 pub struct Story {
     pub name: String,
@@ -20,6 +25,38 @@ impl Story {
             Content::Chapter(_) => acc + 1,
         })
     }
+
+    pub fn find_chapter(&self, id: String) -> Option<FindChapter> {
+        let mut found = None;
+        for content in self.chapters.iter() {
+            if found.is_some() {
+                break;
+            } else if content.id() == id.as_str() {
+                found = Some(FindChapter {
+                    chapter: content,
+                    parent: None,
+                });
+            } else if let Content::Section(s) = content {
+                found = s.find_chapter(&id).map(|f| FindChapter {
+                    chapter: f.chapter,
+                    parent: Some(content),
+                });
+            }
+        }
+        found
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ListedStory {
+    pub name: String,
+    pub author: String,
+    pub chapter_count: usize,
+}
+
+pub struct FindChapter<'a> {
+    pub chapter: &'a Content,
+    pub parent: Option<&'a Content>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +89,26 @@ impl Section {
             Content::Section(inner) => acc + inner.num_chapters(),
             Content::Chapter(_) => acc + 1,
         })
+    }
+
+    pub fn find_chapter(&self, id: &String) -> Option<FindChapter> {
+        let mut found = None;
+        for content in self.chapters.iter() {
+            if found.is_some() {
+                break;
+            } else if content.id() == id.as_str() {
+                found = Some(FindChapter {
+                    chapter: content,
+                    parent: None,
+                });
+            } else if let Content::Section(s) = content {
+                found = s.find_chapter(id).map(|f| FindChapter {
+                    chapter: f.chapter,
+                    parent: Some(content),
+                });
+            }
+        }
+        found
     }
 }
 
@@ -95,9 +152,9 @@ impl Author {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub enum TextFormat {
-    #[allow(dead_code)]
     Html,
     Markdown,
 }
@@ -109,10 +166,16 @@ pub enum StorySource {
     RoyalRoad(String),
 }
 
+pub static SOURCES_LIST: [&str; 3] = [
+    "Archive of Our Own: https://archiveofourown.org/works/<id>",
+    "Katalepsis: https://katalepsis.net",
+    "RoyalRoad: https://www.royalroad.com/fiction/<id>",
+];
+
 static REGEXES: OnceCell<Vec<(&'static str, Regex)>> = OnceCell::new();
 
 impl StorySource {
-    pub fn from_url(url: &str) -> StorySource {
+    pub fn from_url(url: &str) -> Result<StorySource, ArchiveError> {
         let regex_map = REGEXES.get_or_init(|| {
             vec![
                 ("ao3", r"^https://archiveofourown.org/works/(?P<id>\d+)/?.*"),
@@ -130,39 +193,47 @@ impl StorySource {
             .map(|(src, reg_src)| (src, Regex::new(reg_src).unwrap()))
             .collect()
         });
-        regex_map
-            .iter()
-            .find(|(_, regex)| regex.is_match(url))
-            .map(|(name, regex)| {
+        let maybe_match = regex_map.iter().find(|(_, regex)| regex.is_match(url));
+        match maybe_match {
+            Some((name, regex)) => {
                 let id = regex.captures(url).unwrap().name("id");
                 let maybe_error = &format!(
                     "Url {url} maps to source {name} and must contain a story ID, but does not"
                 );
-                match *name {
-                    "ao3" => StorySource::AO3(require_story_source_id(id, maybe_error)),
-                    "katalepsis" => StorySource::Katalepsis,
-                    "rr" => StorySource::RoyalRoad(require_story_source_id(id, maybe_error)),
-                    _ => panic!("No way to convert source {name} to a StorySource"),
-                }
-            })
-            .unwrap() // At this point we know we have a Some() - we'd have panicked otherwise
+                Ok(match *name {
+                    "ao3" => Self::AO3(require_story_source_id(id, maybe_error)),
+                    "katalepsis" => Self::Katalepsis,
+                    "rr" => Self::RoyalRoad(require_story_source_id(id, maybe_error)),
+                    _ => panic!("URL matched source {name}, which has not been fully implemented"),
+                })
+            }
+            None => Err(ArchiveError::BadSource(url.to_owned())),
+        }
     }
 
     pub fn to_id(&self) -> String {
         match self {
-            StorySource::AO3(ref id) => format!("ao3:{}", id),
-            StorySource::Katalepsis => "katalepsis".to_owned(),
-            StorySource::RoyalRoad(ref id) => format!("rr:{}", id),
+            Self::AO3(ref id) => format!("ao3:{}", id),
+            Self::Katalepsis => "katalepsis".to_owned(),
+            Self::RoyalRoad(ref id) => format!("rr:{}", id),
         }
     }
 
     pub fn to_url(&self) -> String {
         match self {
-            StorySource::AO3(id) => {
+            Self::AO3(id) => {
                 format!("https://archiveofourown.org/works/{}", id)
             }
-            StorySource::Katalepsis => "https://katalepsis.net".to_owned(),
-            StorySource::RoyalRoad(id) => format!("https://www.royalroad.com/fiction/{}", id),
+            Self::Katalepsis => "https://katalepsis.net".to_owned(),
+            Self::RoyalRoad(id) => format!("https://www.royalroad.com/fiction/{}", id),
+        }
+    }
+
+    pub fn parser(&self) -> Box<dyn Parser> {
+        match self {
+            Self::AO3(_) => Box::new(AO3Parser {}),
+            Self::Katalepsis => Box::new(KatalepsisParser {}),
+            Self::RoyalRoad(_) => Box::new(RoyalRoadParser {}),
         }
     }
 }

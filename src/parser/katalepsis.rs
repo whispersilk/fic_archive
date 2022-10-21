@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, TimeZone};
 use futures::future::join_all;
 use reqwest::Client;
@@ -7,28 +8,29 @@ use select::{
     node::Node,
     predicate::{self, Predicate},
 };
-use tokio::runtime::Runtime;
 
 use std::iter;
 
 use crate::{
     error::ArchiveError,
-    parser::{custom_convert_to_format, Parser},
-    structs::{Author, Chapter, ChapterText, Content, Section, Story, StorySource, TextFormat},
+    parser::Parser,
+    structs::{Author, Chapter, ChapterText, Content, Section, Story, StorySource},
 };
 
 pub(crate) struct KatalepsisParser;
 
+#[async_trait]
 impl Parser for KatalepsisParser {
-    fn get_skeleton(
+    fn get_client(&self) -> Client {
+        Client::new()
+    }
+
+    async fn get_skeleton(
         &self,
-        runtime: &Runtime,
         client: &Client,
-        format: &TextFormat,
         source: StorySource,
     ) -> Result<Story, ArchiveError> {
-        let main_page =
-            runtime.block_on(async { client.get(source.to_url()).send().await?.text().await })?;
+        let main_page = client.get(source.to_url()).send().await?.text().await?;
         let main_page = Document::from_read(main_page.as_bytes())?;
 
         let name = "Katalepsis".to_owned();
@@ -38,7 +40,6 @@ impl Parser for KatalepsisParser {
                 .find(predicate::Class("entry-content").child(predicate::Name("p")))
                 .take(3)
                 .map(|elem| elem.inner_html())
-                .map(|html| custom_convert_to_format(html, format, Some(Box::new(custom_convert))))
                 .collect(),
         );
         let url = source.to_url();
@@ -124,11 +125,9 @@ impl Parser for KatalepsisParser {
         })
     }
 
-    fn fill_skeleton(
+    async fn fill_skeleton(
         &self,
-        runtime: &Runtime,
         client: &Client,
-        format: &TextFormat,
         mut skeleton: Story,
     ) -> Result<Story, ArchiveError> {
         let mut chapters: Vec<&mut Chapter> = Vec::with_capacity(skeleton.num_chapters());
@@ -190,7 +189,11 @@ impl Parser for KatalepsisParser {
             let chapter_end_index = chapter_end_index.unwrap();
             let chapter_paragraphs = body_elems[chapter_start_index + 1..chapter_end_index]
                 .iter()
-                .map(|chap| chap.inner_html());
+                .map(|chap| {
+                    chap.inner_html()
+                        .replace(">* * *<", " align=\"center\">* * *<")
+                        .replace("==", "<span align=\"center\">* * *</span>")
+                });
             let mut a_n_empty_owner;
             let mut a_n_some_owner;
             let a_n_paragraphs: &mut dyn Iterator<Item = String> =
@@ -206,7 +209,7 @@ impl Parser for KatalepsisParser {
                     &mut a_n_some_owner
                 };
 
-            let body_text = ChapterText::Hydrated(custom_convert_to_format(
+            let body_text = ChapterText::Hydrated(
                 content_warnings
                     .chain(chapter_paragraphs)
                     .chain(a_n_paragraphs)
@@ -214,9 +217,7 @@ impl Parser for KatalepsisParser {
                         !html.contains(">Previous Chapter<") && !html.contains(">Next Chapter<")
                     })
                     .collect(),
-                format,
-                Some(Box::new(custom_convert)),
-            ));
+            );
             let date_posted = document
                 .find(predicate::Class("entry-date"))
                 .next()
@@ -235,22 +236,17 @@ impl Parser for KatalepsisParser {
             Ok(())
         });
 
-        let results = runtime.block_on(async { join_all(hydrate).await });
+        let results = join_all(hydrate).await;
         match results.into_iter().find(|res| res.is_err()) {
             Some(err) => Err(err.unwrap_err()),
             None => Ok(skeleton),
         }
     }
 
-    fn get_story(
-        &self,
-        runtime: &Runtime,
-        format: &TextFormat,
-        source: StorySource,
-    ) -> Result<Story, ArchiveError> {
-        let client = Client::new();
-        let story = self.get_skeleton(runtime, &client, format, source)?;
-        self.fill_skeleton(runtime, &client, format, story)
+    async fn get_story(&self, source: StorySource) -> Result<Story, ArchiveError> {
+        let client = self.get_client();
+        let story = self.get_skeleton(&client, source).await?;
+        self.fill_skeleton(&client, story).await
     }
 }
 
@@ -260,21 +256,5 @@ fn chapters_from_section<'a>(section: &'a mut Section, vec: &mut Vec<&'a mut Cha
             Content::Section(sec) => chapters_from_section(sec, vec),
             Content::Chapter(chap) => vec.push(chap),
         }
-    }
-}
-
-fn custom_convert(formatted_text: String, format: &TextFormat) -> String {
-    match format {
-        TextFormat::Markdown => match formatted_text.as_ref() {
-            "==" => "<span align=\"center\">* * *</span>".to_owned(),
-            _ => {
-                if formatted_text.contains(">* * *<") {
-                    formatted_text.replace(">* * *<", " align=\"center\">* * *<")
-                } else {
-                    formatted_text
-                }
-            }
-        },
-        _ => formatted_text,
     }
 }

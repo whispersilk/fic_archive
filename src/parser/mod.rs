@@ -1,7 +1,7 @@
+use async_trait::async_trait;
 use html2md::parse_html;
 use pandoc::{InputFormat, InputKind, OutputFormat, OutputKind, PandocOutput};
 use reqwest::Client;
-use tokio::runtime::Runtime;
 
 use crate::{
     error::ArchiveError,
@@ -12,37 +12,26 @@ pub mod ao3;
 pub mod katalepsis;
 pub mod royalroad;
 
+#[async_trait]
 pub trait Parser {
-    fn get_skeleton(
+    fn get_client(&self) -> Client;
+    async fn get_skeleton(
         &self,
-        runtime: &Runtime,
         client: &Client,
-        format: &TextFormat,
         source: StorySource,
     ) -> Result<Story, ArchiveError>;
-    fn fill_skeleton(
-        &self,
-        runtime: &Runtime,
-        client: &Client,
-        format: &TextFormat,
-        skeleton: Story,
-    ) -> Result<Story, ArchiveError>;
-    fn get_story(
-        &self,
-        runtime: &Runtime,
-        format: &TextFormat,
-        source: StorySource,
-    ) -> Result<Story, ArchiveError>;
+    async fn fill_skeleton(&self, client: &Client, skeleton: Story) -> Result<Story, ArchiveError>;
+    async fn get_story(&self, source: StorySource) -> Result<Story, ArchiveError>;
 }
 
-fn convert_to_format(html: String, format: &TextFormat) -> String {
+fn convert_to_format(html: String, format: TextFormat) -> String {
     custom_convert_to_format(html, format, None)
 }
 
 fn custom_convert_to_format(
     html: String,
-    format: &TextFormat,
-    custom_behavior: Option<Box<dyn Fn(String, &TextFormat) -> String>>,
+    format: TextFormat,
+    custom_behavior: Option<Box<dyn Fn(String, TextFormat) -> String>>,
 ) -> String {
     let initial_text = match format {
         TextFormat::Html => html,

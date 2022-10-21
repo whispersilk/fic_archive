@@ -2,69 +2,120 @@ use chrono::DateTime;
 use rayon::prelude::ParallelSliceMut;
 use rusqlite::{Connection, Error, Result};
 
+use std::ops::{Deref, DerefMut};
+use std::sync::Mutex;
+
 use crate::error::ArchiveError;
-use crate::structs::{Author, Chapter, ChapterText, Content, Section, Story, StorySource};
+use crate::structs::{
+    Author, Chapter, ChapterText, Content, ListedStory, Section, Story, StorySource,
+};
+
+static TABLES_CREATED: once_cell::sync::OnceCell<Mutex<bool>> = once_cell::sync::OnceCell::new();
 
 pub fn create_tables(conn: &Connection) -> Result<(), Error> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS authors (
-		    id TEXT PRIMARY KEY,
-		    name TEXT NOT NULL
-		)",
-        (),
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS stories (
-		    id TEXT NOT NULL PRIMARY KEY,
-		    name TEXT NOT NULL,
-		    description TEXT,
-		    url TEXT NOT NULL,
-		    author_id TEXT NOT NULL REFERENCES authors(id)
-		)",
-        (),
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS sections (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			description TEXT,
-			url TEXT,
-			story_id TEXT NOT NULL REFERENCES stories(id),
-			parent_id TEXT
-		)",
-        (),
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS chapters (
-			id TEXT PRIMARY KEY,
-			name TEXT NOT NULL,
-			description TEXT,
-			text TEXT NOT NULL,
-			url TEXT NOT NULL,
-			date_posted TEXT NOT NULL,
-			story_id TEXT NOT NULL REFERENCES stories(id),
-			section_id TEXT REFERENCES sections(id)
-		)",
-        (),
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS tags (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL
-        )",
-        (),
-    )?;
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS tag_uses (
-            tag_id TEXT NOT NULL REFERENCES tags(id),
-            story_id TEXT NOT NULL REFERENCES stories(id)
-        )",
-        (),
-    )?;
+    let mut lock = TABLES_CREATED
+        .get_or_init(|| Mutex::new(false))
+        .lock()
+        .unwrap();
+    if !lock.deref() {
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS authors (
+    		    id TEXT PRIMARY KEY,
+    		    name TEXT NOT NULL
+    		)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS stories (
+    		    id TEXT NOT NULL PRIMARY KEY,
+    		    name TEXT NOT NULL,
+    		    description TEXT,
+    		    url TEXT NOT NULL,
+    		    author_id TEXT NOT NULL REFERENCES authors(id)
+    		)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sections (
+    			id TEXT PRIMARY KEY,
+    			name TEXT NOT NULL,
+    			description TEXT,
+    			url TEXT,
+    			story_id TEXT NOT NULL REFERENCES stories(id),
+    			parent_id TEXT
+    		)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS chapters (
+    			id TEXT PRIMARY KEY,
+    			name TEXT NOT NULL,
+    			description TEXT,
+    			text TEXT NOT NULL,
+    			url TEXT NOT NULL,
+    			date_posted TEXT NOT NULL,
+    			story_id TEXT NOT NULL REFERENCES stories(id),
+    			section_id TEXT REFERENCES sections(id)
+    		)",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tags (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL
+            )",
+            (),
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tag_uses (
+                tag_id TEXT NOT NULL REFERENCES tags(id),
+                story_id TEXT NOT NULL REFERENCES stories(id)
+            )",
+            (),
+        )?;
+        *lock.deref_mut() = true;
+    }
     Ok(())
 }
 
-pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, ArchiveError> {
+pub fn get_all_stories(conn: &Connection) -> Result<Vec<ListedStory>, ArchiveError> {
+    create_tables(conn)?;
+    let mut failed_stories = 0;
+    let mut stmt = conn.prepare(
+        "SELECT
+            stories.name,
+            authors.name,
+            COUNT(chapters.id) AS chapter_count
+        FROM stories
+            INNER JOIN authors ON stories.author_id = authors.id
+            INNER JOIN chapters ON stories.id = chapters.story_id
+        GROUP BY stories.id",
+    )?;
+    let stories: Vec<ListedStory> = stmt
+        .query_map([], |row| {
+            Ok(ListedStory {
+                name: row.get(0)?,
+                author: row.get(1)?,
+                chapter_count: row.get(2)?,
+            })
+        })?
+        .filter_map(|listed| match listed {
+            Ok(story) => Some(story),
+            Err(_) => {
+                failed_stories += 1;
+                None
+            }
+        })
+        .collect();
+    println!(
+        "Got {} stories. Failed to get {failed_stories} stories.",
+        stories.len()
+    );
+
+    Ok(stories)
+}
+
+pub fn story_exists_with_id(conn: &Connection, id: &str) -> Result<bool, ArchiveError> {
     create_tables(conn)?;
     let mut stmt = conn.prepare("SELECT COUNT(1) FROM stories WHERE id = :id")?;
     let story_exists = stmt
@@ -72,12 +123,33 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
             Ok(0) => Ok(None),
             Ok(1) => Ok(Some(())),
             _ => Ok(None),
-        });
-    let story_exists = story_exists.is_ok() && story_exists.unwrap().is_some();
-    if !story_exists {
+        })
+        .unwrap_or(None);
+    Ok(story_exists.is_some())
+}
+
+pub fn fuzzy_get_story(conn: &Connection, search: &str) -> Result<Vec<String>, ArchiveError> {
+    create_tables(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT stories.id
+        FROM stories INNER JOIN authors ON stories.author_id = authors.id
+        WHERE
+            stories.name LIKE %:search%
+            OR stories.id = :search
+            OR authors.name LIKE %:search%",
+    )?;
+    let matches = stmt
+        .query_map(&[(":search", search)], |row| Ok(row.get(0)?))?
+        .filter_map(|id| id.ok())
+        .collect();
+    Ok(matches)
+}
+
+pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, ArchiveError> {
+    if !story_exists_with_id(conn, id)? {
         Ok(None)
     } else {
-        stmt = conn.prepare(
+        let mut stmt = conn.prepare(
             "SELECT id, name, description, url, parent_id FROM sections WHERE story_id = :story_id",
         )?;
         let mut sections: Vec<(Option<String>, Section)> = stmt
@@ -113,7 +185,11 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
             .map(|sec| sec.unwrap())
             .collect();
 
-        stmt = conn.prepare("SELECT id, name, description, text, url, date_posted, section_id FROM chapters WHERE story_id = :story_id")?;
+        stmt = conn.prepare(
+            "SELECT id, name, description, text, url, date_posted, section_id
+            FROM chapters
+            WHERE story_id = :story_id",
+        )?;
         let mut chapters: Vec<(Option<String>, Chapter)> = stmt
             .query_map(&[(":story_id", id)], |row| {
                 let section_id = row.get::<usize, String>(6)?;
@@ -196,8 +272,7 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
         story_chapters.par_sort_unstable_by(|a, b| a.id().cmp(b.id()));
 
         stmt = conn.prepare(
-            "SELECT
-                tags.name
+            "SELECT tags.name
             FROM tag_uses INNER JOIN tags
             ON tags.id = tag_uses.tag_id
             WHERE tag_uses.story_id = :story_id",
@@ -209,33 +284,40 @@ pub fn get_story_by_id(conn: &Connection, id: &str) -> Result<Option<Story>, Arc
             .collect();
 
         stmt = conn.prepare(
-            "SELECT
-                stories.name,
-                stories.description,
-                stories.url,
-                stories.author_id,
-                authors.name
+            "SELECT stories.name, stories.description, stories.url, stories.author_id, authors.name
             FROM stories INNER JOIN authors
             ON stories.author_id = authors.id
             WHERE stories.id = :story_id",
         )?;
-        stmt
+        let mut story = stmt
             .query_row(&[(":story_id", id)], |row| {
-                Ok(Story {
-                    name: row.get(0)?,
-                    description: row.get(1)?,
-                    url: row.get(2)?,
-                    author: Author {
-                        id: row.get(3)?,
-                        name: row.get(4)?,
+                let source =
+                    StorySource::from_url(row.get::<usize, String>(2)?.as_str()).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                Ok((
+                    row.get::<usize, String>(2)?,
+                    Story {
+                        name: row.get(0)?,
+                        description: row.get(1)?,
+                        url: row.get(2)?,
+                        author: Author {
+                            id: row.get(3)?,
+                            name: row.get(4)?,
+                        },
+                        chapters: story_chapters,
+                        tags: story_tags,
+                        source,
                     },
-                    chapters: story_chapters,
-                    tags: story_tags,
-                    source: StorySource::from_url(row.get::<usize, String>(2)?.as_str()),
-                })
+                ))
             })
-            .map(|story| Some(story))
-            .map_err(|err| err.into())
+            .map_err(ArchiveError::from)?;
+        story.1.source = StorySource::from_url(story.0.as_str())?;
+        Ok(Some(story.1))
     }
 }
 
@@ -272,7 +354,7 @@ pub fn save_story(conn: &Connection, story: &Story) -> Result<(), ArchiveError> 
     Ok(())
 }
 
-fn save_content(
+pub fn save_content(
     conn: &Connection,
     content: &Content,
     story_id: &str,

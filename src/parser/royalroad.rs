@@ -1,14 +1,14 @@
+use async_trait::async_trait;
 use chrono::DateTime;
 use futures::future::join_all;
 use regex::Regex;
 use reqwest::Client;
 use select::{document::Document, predicate, predicate::Predicate};
-use tokio::runtime::Runtime;
 
 use crate::{
     error::ArchiveError,
-    parser::{convert_to_format, Parser},
-    structs::{Author, Chapter, ChapterText, Content, Story, StorySource, TextFormat},
+    parser::Parser,
+    structs::{Author, Chapter, ChapterText, Content, Story, StorySource},
 };
 
 static CHAPTER_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) =
@@ -16,22 +16,19 @@ static CHAPTER_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) =
 
 pub(crate) struct RoyalRoadParser;
 
+#[async_trait]
 impl Parser for RoyalRoadParser {
-    fn get_skeleton(
+    fn get_client(&self) -> Client {
+        Client::new()
+    }
+
+    async fn get_skeleton(
         &self,
-        runtime: &Runtime,
         client: &Client,
-        format: &TextFormat,
         source: StorySource,
     ) -> Result<Story, ArchiveError> {
-        let main_page = Document::from_read(
-            runtime
-                .block_on(async {
-                    let intermediate = client.get(&source.to_url()).send().await?;
-                    intermediate.text().await
-                })?
-                .as_bytes(),
-        )?;
+        let main_page = client.get(&source.to_url()).send().await?.text().await?;
+        let main_page = Document::from_read(main_page.as_bytes())?;
         let chapters = main_page
             .find(
                 predicate::Attr("id", "chapters")
@@ -133,30 +130,29 @@ impl Parser for RoyalRoadParser {
         };
         let description = main_page
             .find(
-                predicate::Class("hidden-content")
-                    .and(predicate::Attr("property", "description"))
-                    .child(predicate::Name("p")),
+                predicate::Class("hidden-content").and(predicate::Attr("property", "description")),
             )
             .map(|elem| elem.inner_html())
             .collect();
-        let description = convert_to_format(description, format);
+        let tags = main_page
+            .find(predicate::Class("tags").child(predicate::Name("a")))
+            .map(|elem| elem.text())
+            .collect();
 
         Ok(Story {
             name: title,
             author,
             description: Some(description),
             url: source.to_url(),
-            tags: Vec::new(),
+            tags,
             chapters,
             source,
         })
     }
 
-    fn fill_skeleton(
+    async fn fill_skeleton(
         &self,
-        runtime: &Runtime,
         client: &Client,
-        format: &TextFormat,
         mut skeleton: Story,
     ) -> Result<Story, ArchiveError> {
         let hydrate = skeleton
@@ -171,7 +167,7 @@ impl Parser for RoyalRoadParser {
                 Ok((chapter, page))
             });
 
-        let results = runtime.block_on(async { join_all(hydrate).await });
+        let results = join_all(hydrate).await;
         if results
             .iter()
             .any(|res: &Result<(_, _), ArchiveError>| res.is_err())
@@ -186,13 +182,10 @@ impl Parser for RoyalRoadParser {
                 s.spawn(|_| {
                     let document = Document::from_read(page.as_bytes())
                         .expect("Couldn't read page to a document");
-                    let body_text: String = convert_to_format(
-                        document
-                            .find(predicate::Class("chapter-content").child(predicate::Name("p")))
-                            .map(|elem| elem.html())
-                            .collect(),
-                        format,
-                    );
+                    let body_text = document
+                        .find(predicate::Class("chapter-content").child(predicate::Name("p")))
+                        .map(|elem| elem.html())
+                        .collect();
                     chapter.text = ChapterText::Hydrated(body_text);
                 });
             }
@@ -200,14 +193,9 @@ impl Parser for RoyalRoadParser {
         Ok(skeleton)
     }
 
-    fn get_story(
-        &self,
-        runtime: &Runtime,
-        format: &TextFormat,
-        source: StorySource,
-    ) -> Result<Story, ArchiveError> {
-        let client = Client::new();
-        let story = self.get_skeleton(runtime, &client, format, source)?;
-        self.fill_skeleton(runtime, &client, format, story)
+    async fn get_story(&self, source: StorySource) -> Result<Story, ArchiveError> {
+        let client = self.get_client();
+        let story = self.get_skeleton(&client, source).await?;
+        self.fill_skeleton(&client, story).await
     }
 }

@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use chrono::{
     naive::NaiveDate,
     offset::{FixedOffset, Local, TimeZone},
@@ -10,12 +11,11 @@ use select::{
     document::Document,
     predicate::{self, Predicate},
 };
-use tokio::runtime::Runtime;
 
 use crate::{
     error::ArchiveError,
-    parser::{convert_to_format, Parser},
-    structs::{Author, Chapter, ChapterText, Content, Story, StorySource, TextFormat},
+    parser::Parser,
+    structs::{Author, Chapter, ChapterText, Content, Story, StorySource},
 };
 
 static CHAPTER_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) =
@@ -23,12 +23,15 @@ static CHAPTER_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) =
 
 pub(crate) struct AO3Parser;
 
+#[async_trait]
 impl Parser for AO3Parser {
-    fn get_skeleton(
+    fn get_client(&self) -> Client {
+        Client::builder().cookie_store(true).build().unwrap()
+    }
+
+    async fn get_skeleton(
         &self,
-        runtime: &Runtime,
         client: &Client,
-        format: &TextFormat,
         source: StorySource,
     ) -> Result<Story, ArchiveError> {
         let main_page = async {
@@ -49,7 +52,7 @@ impl Parser for AO3Parser {
                 .text()
                 .await?)
         };
-        let (main_result, nav_result) = runtime.block_on(async { join(main_page, navigate).await });
+        let (main_result, nav_result) = join(main_page, navigate).await;
         if let Err(e) = main_result {
             return Err(e);
         } else if let Err(e) = nav_result {
@@ -84,11 +87,7 @@ impl Parser for AO3Parser {
         let description = main_page
             .find(predicate::Class("summary").child(predicate::Class("userstuff")))
             .next()
-            .map(|n| {
-                n.children()
-                    .map(|elem| convert_to_format(elem.inner_html(), format))
-                    .collect()
-            });
+            .map(|n| n.children().map(|elem| elem.inner_html()).collect());
         let url = source.to_url();
         let tags = get_tags(&main_page);
         let chapters = navigate
@@ -148,11 +147,9 @@ impl Parser for AO3Parser {
         })
     }
 
-    fn fill_skeleton(
+    async fn fill_skeleton(
         &self,
-        runtime: &Runtime,
         client: &Client,
-        format: &TextFormat,
         mut skeleton: Story,
     ) -> Result<Story, ArchiveError> {
         let hydrate = skeleton
@@ -167,7 +164,7 @@ impl Parser for AO3Parser {
                 Ok((chapter, page))
             });
 
-        let results = runtime.block_on(async { join_all(hydrate).await });
+        let results = join_all(hydrate).await;
         if results
             .iter()
             .any(|res: &Result<(_, _), ArchiveError>| res.is_err())
@@ -190,19 +187,16 @@ impl Parser for AO3Parser {
                         .find(predicate::Class("userstuff").and(predicate::Attr("role", "article")))
                         .next();
 
-                    let chapter_text = convert_to_format(
-                        format!(
-                            "{}{}{}",
-                            top_notes.map(|n| n.inner_html()).unwrap_or_default(),
-                            chapter_text
-                                .expect("Chapter has no text area")
-                                .children()
-                                .filter(|node| !node.is(predicate::Attr("id", "work")))
-                                .map(|node| node.html())
-                                .collect::<String>(),
-                            bottom_notes.map(|n| n.inner_html()).unwrap_or_default()
-                        ),
-                        format,
+                    let chapter_text = format!(
+                        "{}{}{}",
+                        top_notes.map(|n| n.inner_html()).unwrap_or_default(),
+                        chapter_text
+                            .expect("Chapter has no text area")
+                            .children()
+                            .filter(|node| !node.is(predicate::Attr("id", "work")))
+                            .map(|node| node.html())
+                            .collect::<String>(),
+                        bottom_notes.map(|n| n.inner_html()).unwrap_or_default()
                     );
 
                     chapter.text = ChapterText::Hydrated(chapter_text);
@@ -212,15 +206,10 @@ impl Parser for AO3Parser {
         Ok(skeleton)
     }
 
-    fn get_story(
-        &self,
-        runtime: &Runtime,
-        format: &TextFormat,
-        source: StorySource,
-    ) -> Result<Story, ArchiveError> {
-        let client = Client::builder().cookie_store(true).build().unwrap();
-        let story = self.get_skeleton(runtime, &client, format, source)?;
-        self.fill_skeleton(runtime, &client, format, story)
+    async fn get_story(&self, source: StorySource) -> Result<Story, ArchiveError> {
+        let client = self.get_client();
+        let story = self.get_skeleton(&client, source).await?;
+        self.fill_skeleton(&client, story).await
     }
 }
 
