@@ -8,6 +8,7 @@ use self::error::ArchiveError;
 use self::structs::{Content, StorySource, SOURCES_LIST};
 
 mod args;
+mod client;
 mod error;
 mod parser;
 mod sql;
@@ -19,7 +20,7 @@ async fn main() -> Result<(), ArchiveError> {
     let conn = Connection::open("/home/daniel/Documents/Code/fic_archive/test_db.db")?;
 
     match args.command {
-        Commands::Add { story } => add_story(story, &conn).await?,
+        Commands::Add { stories } => add_stories(stories, &conn).await?,
         Commands::Update {
             story,
             force_refresh,
@@ -72,18 +73,40 @@ async fn main() -> Result<(), ArchiveError> {
     Ok(())
 }
 
-async fn add_story(story: String, conn: &Connection) -> Result<(), ArchiveError> {
-    let source = StorySource::from_url(story.as_str())?;
-    if sql::story_exists_with_id(conn, story.as_str())? {
-        println!("Story already exists in the archive. Updating...");
-        update_archive(Some(story), false, conn).await
-    } else {
-        let parser = source.parser();
-        let story = parser.get_story(source).await?;
-        sql::save_story(conn, &story)?;
-        println!("Saved {} ({} chapters)", story.name, story.num_chapters());
-        Ok(())
+async fn add_stories(stories: Vec<String>, conn: &Connection) -> Result<(), ArchiveError> {
+    let mut errors: Vec<ArchiveError> = Vec::new();
+    for story in stories.iter() {
+        match StorySource::from_url(&story) {
+            Ok(source) => match add_story(source, conn).await {
+                Ok(_) => (),
+                Err(err) => errors.push(err),
+            },
+            Err(err) => errors.push(err),
+        };
     }
+    errors.into_iter().next().map(|e| Err(e)).unwrap_or(Ok(()))
+}
+
+async fn add_story(source: StorySource, conn: &Connection) -> Result<(), ArchiveError> {
+    let exists = sql::story_exists_with_id(conn, &source.to_id())?;
+    let url = source.to_url();
+    if exists {
+        let new_chapters = update_story(source, false, conn).await?;
+        println!(
+            "Updated story at {} with {} new chapters.",
+            url, new_chapters
+        );
+    } else {
+        let story = source.parser().get_story(source).await?;
+        sql::save_story(conn, &story)?;
+        println!(
+            "Added story {} ({} chapter{})",
+            story.name,
+            story.num_chapters(),
+            if story.num_chapters() == 1 { "" } else { "s" }
+        );
+    }
+    Ok(())
 }
 
 async fn update_archive(
@@ -110,8 +133,7 @@ async fn update_story(
     let existing_story = sql::get_story_by_id(conn, source.to_id().as_str())?
         .ok_or_else(|| ArchiveError::StoryNotExists(source.to_url()))?;
     let parser = source.parser();
-    let client = parser.get_client();
-    let new_skeleton = parser.get_skeleton(&client, source).await?;
+    let new_skeleton = parser.get_skeleton(source).await?;
 
     // Get a list of existing chapters and a list of fetched chapters, then filter to only fetched chapters that aren't saved.
     let mut existing_chapters: HashSet<String> =
@@ -133,7 +155,7 @@ async fn update_story(
     // If there are any new chapters, fetch the story and save them.
     let mut added_chapters = 0;
     if !new_chapters.is_empty() {
-        let new_story = parser.fill_skeleton(&client, new_skeleton).await?;
+        let new_story = parser.fill_skeleton(new_skeleton).await?;
         for chapter in new_chapters.into_iter() {
             match new_story.find_chapter(chapter) {
                 Some(found) => {
@@ -166,6 +188,7 @@ async fn delete_story(search: String, conn: &Connection) -> Result<(), ArchiveEr
     match matches.len() {
         0 => println!("No matching stories found. Please try another search."),
         // 1 => sql::delete_story_by_id(matches[0])?,
+        1 => println!("Got one story back! Id: {}", matches[0]),
         _ => todo!(),
     }
     Ok(())

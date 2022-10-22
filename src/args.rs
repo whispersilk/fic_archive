@@ -9,10 +9,10 @@ pub(crate) struct Args {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Commands {
-    /// Add a story to the archive.
+    /// Add one or more stories to the archive.
     Add {
-        /// The URL of the story to add.
-        story: String,
+        /// The URLs of the story or stories to add.
+        stories: Vec<String>,
     },
 
     /// Check for updates to stories in the archive.

@@ -1,6 +1,6 @@
 use chrono::{DateTime, FixedOffset};
 use once_cell::sync::OnceCell;
-use regex::{Match, Regex};
+use regex::Regex;
 
 use crate::error::ArchiveError;
 use crate::parser::{
@@ -152,13 +152,6 @@ impl Author {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
-pub enum TextFormat {
-    Html,
-    Markdown,
-}
-
 #[derive(Debug, Clone)]
 pub enum StorySource {
     AO3(String),
@@ -193,17 +186,21 @@ impl StorySource {
             .map(|(src, reg_src)| (src, Regex::new(reg_src).unwrap()))
             .collect()
         });
-        let maybe_match = regex_map.iter().find(|(_, regex)| regex.is_match(url));
-        match maybe_match {
+        match regex_map.iter().find(|(_, regex)| regex.is_match(url)) {
             Some((name, regex)) => {
                 let id = regex.captures(url).unwrap().name("id");
-                let maybe_error = &format!(
-                    "Url {url} maps to source {name} and must contain a story ID, but does not"
-                );
                 Ok(match *name {
-                    "ao3" => Self::AO3(require_story_source_id(id, maybe_error)),
+                    "ao3" => Self::AO3(
+                        id.ok_or(ArchiveError::NoIdInSource(url.to_owned(), name.to_string()))?
+                            .as_str()
+                            .to_owned(),
+                    ),
                     "katalepsis" => Self::Katalepsis,
-                    "rr" => Self::RoyalRoad(require_story_source_id(id, maybe_error)),
+                    "rr" => Self::RoyalRoad(
+                        id.ok_or(ArchiveError::NoIdInSource(url.to_owned(), name.to_string()))?
+                            .as_str()
+                            .to_owned(),
+                    ),
                     _ => panic!("URL matched source {name}, which has not been fully implemented"),
                 })
             }
@@ -236,21 +233,4 @@ impl StorySource {
             Self::RoyalRoad(_) => Box::new(RoyalRoadParser {}),
         }
     }
-}
-
-fn require_story_source_id(id_match: Option<Match>, errormsg: &str) -> String {
-    id_match.expect(errormsg).as_str().to_owned()
-}
-
-#[derive(Clone, Debug)]
-pub struct StoryBase {
-    pub title: String,
-    pub author: Author,
-    pub chapter_links: Vec<ChapterLink>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ChapterLink {
-    pub url: String,
-    pub title: String,
 }

@@ -3,16 +3,14 @@ use chrono::{
     naive::NaiveDate,
     offset::{FixedOffset, Local, TimeZone},
 };
-use futures::future::join;
-use futures::future::join_all;
 use regex::Regex;
-use reqwest::Client;
 use select::{
     document::Document,
     predicate::{self, Predicate},
 };
 
 use crate::{
+    client::get_with_query,
     error::ArchiveError,
     parser::Parser,
     structs::{Author, Chapter, ChapterText, Content, Story, StorySource},
@@ -25,83 +23,85 @@ pub(crate) struct AO3Parser;
 
 #[async_trait]
 impl Parser for AO3Parser {
-    fn get_client(&self) -> Client {
-        Client::builder().cookie_store(true).build().unwrap()
-    }
-
-    async fn get_skeleton(
-        &self,
-        client: &Client,
-        source: StorySource,
-    ) -> Result<Story, ArchiveError> {
-        let main_page = async {
-            Ok(client
-                .get(source.to_url())
-                .query(&[("view_adult", "true")])
-                .send()
-                .await?
-                .text()
-                .await?)
-        };
-        let navigate = async {
-            Ok(client
-                .get(format!("{}/navigate", source.to_url()))
-                .query(&[("view_adult", "true")])
-                .send()
-                .await?
-                .text()
-                .await?)
-        };
-        let (main_result, nav_result) = join(main_page, navigate).await;
-        if let Err(e) = main_result {
-            return Err(e);
-        } else if let Err(e) = nav_result {
-            return Err(e);
-        }
-        let main_page = Document::from_read(main_result.unwrap().as_bytes())?;
-        let navigate = Document::from_read(nav_result.unwrap().as_bytes())?;
+    async fn get_skeleton(&self, source: StorySource) -> Result<Story, ArchiveError> {
+        let main_page = get_with_query(
+            &source.to_url(),
+            &[("view_adult", "true"), ("view_full_work", "true")],
+        )
+        .await?
+        .text()
+        .await?;
+        let navigate = get_with_query(
+            &format!("{}/navigate", source.to_url()),
+            &[("view_adult", "true")],
+        )
+        .await?
+        .text()
+        .await?;
+        let main_page = Document::from_read(main_page.as_bytes())?;
+        let navigate = Document::from_read(navigate.as_bytes())?;
 
         let name = main_page
             .find(predicate::Class("title").and(predicate::Class("heading")))
             .next()
-            .expect("Story did not have a title")
+            .ok_or(ArchiveError::PageError(format!(
+                "AO3: Could not find title (.title.heading) for story at {}",
+                source.to_url(),
+            )))?
             .text();
+
         let author = main_page
-            .find(predicate::Attr("rel", "author"))
+            .find(predicate::Attr("rel", "author").and(predicate::Attr("href", ())))
             .next()
-            .expect("Story did not have author");
+            .ok_or(ArchiveError::PageError(format!(
+                "AO3: Could not find author ([rel=\"author\"]) for {} at {}",
+                name,
+                source.to_url(),
+            )))?;
         let author_url = author
             .attr("href")
-            .expect("Author did not have link")
-            .replace("/users/", "");
-        let mut author_url_split = author_url.splitn(2, "/pseuds/");
-        let (base_author, pseud) = (author_url_split.next(), author_url_split.next());
+            .expect("Author link should have href because of find() conditions");
         let author = Author {
             name: author.text(),
             id: format!(
-                "ao3:{}:{}",
-                base_author.expect("Could not find author"),
-                pseud.unwrap_or("")
+                "ao3{}",
+                author_url
+                    .replace("/users/", "")
+                    .splitn(2, "/pseuds/")
+                    .fold(String::new(), |mut acc, s| {
+                        acc.push(':');
+                        acc.push_str(s);
+                        acc
+                    }),
             ),
         };
+
         let description = main_page
             .find(predicate::Class("summary").child(predicate::Class("userstuff")))
             .next()
             .map(|n| n.children().map(|elem| elem.inner_html()).collect());
         let url = source.to_url();
         let tags = get_tags(&main_page);
-        let chapters = navigate
-            .find(predicate::Class("chapter").and(predicate::Class("index")))
-            .next()
-            .expect("Navigation page must have chapter index")
-            .children()
-            .filter(|node| node.is(predicate::Name("li")))
-            .map(|li| {
-                let chap = li
+
+        let chapters = main_page
+            .find(predicate::Attr("id", "chapters").child(predicate::Class("chapter")))
+            .map(|chapter| {
+                let title_h3 = chapter
+                    .descendants()
+                    .find(|n| n.is(predicate::Class("title")))
+                    .expect("Chapter should have title.");
+                let href = title_h3
                     .children()
-                    .find(|c| c.is(predicate::Name("a")))
-                    .expect("Chapter should have <a>");
-                let href = chap.attr("href").expect("Chapterlink should have link");
+                    .find_map(|n| n.attr("href"))
+                    .expect("Chapter should have link.");
+                let name = title_h3.text();
+                let mut name_pieces = name.splitn(2, ":");
+                let (chapter_num, chapter_name) = (name_pieces.next(), name_pieces.next());
+                let name = chapter_name
+                    .or(chapter_num)
+                    .expect("Chapter should have a name or number")
+                    .trim()
+                    .to_owned();
                 let chap_id = CHAPTER_REGEX
                     .1
                     .get_or_init(|| Regex::new(CHAPTER_REGEX.0).unwrap())
@@ -111,27 +111,61 @@ impl Parser for AO3Parser {
                     .expect("Chapter url must contain id")
                     .as_str();
 
-                let posted_on = li
+                let posted_on = navigate
+                    .find(predicate::Attr("href", href))
+                    .next()
+                    .expect("Navigation page should have a link with this chapter's URL")
+                    .parent()
+                    .unwrap()
                     .children()
-                    .find(|c| c.is(predicate::Name("span")))
-                    .expect("Chapter should have date posted")
-                    .text();
+                    .find_map(|c| {
+                        if c.is(predicate::Class("datetime")) {
+                            Some(c.text())
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("Navigation page should have a datetime span for this chapter");
                 let posted_on = posted_on.trim();
                 let timezone = FixedOffset::west(Local::now().offset().utc_minus_local());
+                let date_posted = timezone
+                    .from_local_datetime(
+                        &NaiveDate::parse_from_str(&posted_on[1..posted_on.len() - 1], "%F")
+                            .expect("Could not parse datestring to date")
+                            .and_hms(3, 0, 0),
+                    )
+                    .earliest()
+                    .expect("Could not turn naive to full date");
+
+                let top_notes = chapter
+                    .children()
+                    .find(|c| c.is(predicate::Attr("id", "notes")));
+                let bottom_notes = chapter
+                    .children()
+                    .find(|c| c.is(predicate::Class("end").and(predicate::Class("notes"))));
+                let chapter_text = chapter.children().find(|c| {
+                    c.is(predicate::Class("userstuff").and(predicate::Attr("role", "article")))
+                });
+
+                let chapter_text = format!(
+                    "{}{}{}",
+                    top_notes.map(|n| n.inner_html()).unwrap_or_default(),
+                    chapter_text
+                        .expect("Chapter has no text area")
+                        .children()
+                        .filter(|node| !node.is(predicate::Attr("id", "work")))
+                        .map(|node| node.html())
+                        .collect::<String>(),
+                    bottom_notes.map(|n| n.inner_html()).unwrap_or_default()
+                );
+
                 Content::Chapter(Chapter {
                     id: format!("{}:{}", source.to_id(), chap_id),
-                    name: chap.text(),
+                    name,
                     description: None,
-                    text: ChapterText::Dehydrated,
+                    text: ChapterText::Hydrated(chapter_text),
                     url: format!("https://archiveofourown.org{}", href),
-                    date_posted: timezone
-                        .from_local_datetime(
-                            &NaiveDate::parse_from_str(&posted_on[1..posted_on.len() - 1], "%F")
-                                .expect("Could not parse datestring to date")
-                                .and_hms(3, 0, 0),
-                        )
-                        .earliest()
-                        .expect("Could not turn naive to full date"),
+                    date_posted,
                 })
             })
             .collect();
@@ -147,72 +181,16 @@ impl Parser for AO3Parser {
         })
     }
 
-    async fn fill_skeleton(
-        &self,
-        client: &Client,
-        mut skeleton: Story,
-    ) -> Result<Story, ArchiveError> {
-        let hydrate = skeleton
-            .chapters
-            .iter_mut()
-            .filter_map(|con| match con {
-                Content::Section(_) => None,
-                Content::Chapter(c) => Some(c),
-            })
-            .map(|chapter| async {
-                let page = client.get(&chapter.url).send().await?.text().await?;
-                Ok((chapter, page))
-            });
-
-        let results = join_all(hydrate).await;
-        if results
-            .iter()
-            .any(|res: &Result<(_, _), ArchiveError>| res.is_err())
-        {
-            return Err(ArchiveError::Internal("Oopsie!".to_owned()));
-        }
-
-        let mut results: Vec<(&mut Chapter, String)> =
-            results.into_iter().map(|r| r.unwrap()).collect();
-        rayon::scope(|s| {
-            for (chapter, page) in results.iter_mut() {
-                s.spawn(|_| {
-                    let document = Document::from_read(page.as_bytes())
-                        .expect("Couldn't read page to a document");
-                    let top_notes = document.find(predicate::Attr("id", "notes")).next();
-                    let bottom_notes = document
-                        .find(predicate::Class("end").and(predicate::Class("notes")))
-                        .next();
-                    let chapter_text = document
-                        .find(predicate::Class("userstuff").and(predicate::Attr("role", "article")))
-                        .next();
-
-                    let chapter_text = format!(
-                        "{}{}{}",
-                        top_notes.map(|n| n.inner_html()).unwrap_or_default(),
-                        chapter_text
-                            .expect("Chapter has no text area")
-                            .children()
-                            .filter(|node| !node.is(predicate::Attr("id", "work")))
-                            .map(|node| node.html())
-                            .collect::<String>(),
-                        bottom_notes.map(|n| n.inner_html()).unwrap_or_default()
-                    );
-
-                    chapter.text = ChapterText::Hydrated(chapter_text);
-                });
-            }
-        });
+    async fn fill_skeleton(&self, skeleton: Story) -> Result<Story, ArchiveError> {
         Ok(skeleton)
     }
 
     async fn get_story(&self, source: StorySource) -> Result<Story, ArchiveError> {
-        let client = self.get_client();
-        let story = self.get_skeleton(&client, source).await?;
-        self.fill_skeleton(&client, story).await
+        self.get_skeleton(source).await
     }
 }
 
+/// TODO Support series listings and collections at some point?
 fn get_tags(document: &Document) -> Vec<String> {
     document
         .find(

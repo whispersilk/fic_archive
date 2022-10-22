@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, FixedOffset, TimeZone};
 use futures::future::join_all;
-use reqwest::Client;
 use select::{
     document::Document,
     node::Data::Text,
@@ -12,6 +11,7 @@ use select::{
 use std::iter;
 
 use crate::{
+    client::get,
     error::ArchiveError,
     parser::Parser,
     structs::{Author, Chapter, ChapterText, Content, Section, Story, StorySource},
@@ -21,16 +21,8 @@ pub(crate) struct KatalepsisParser;
 
 #[async_trait]
 impl Parser for KatalepsisParser {
-    fn get_client(&self) -> Client {
-        Client::new()
-    }
-
-    async fn get_skeleton(
-        &self,
-        client: &Client,
-        source: StorySource,
-    ) -> Result<Story, ArchiveError> {
-        let main_page = client.get(source.to_url()).send().await?.text().await?;
+    async fn get_skeleton(&self, source: StorySource) -> Result<Story, ArchiveError> {
+        let main_page = get(&source.to_url()).await?.text().await?;
         let main_page = Document::from_read(main_page.as_bytes())?;
 
         let name = "Katalepsis".to_owned();
@@ -125,11 +117,7 @@ impl Parser for KatalepsisParser {
         })
     }
 
-    async fn fill_skeleton(
-        &self,
-        client: &Client,
-        mut skeleton: Story,
-    ) -> Result<Story, ArchiveError> {
+    async fn fill_skeleton(&self, mut skeleton: Story) -> Result<Story, ArchiveError> {
         let mut chapters: Vec<&mut Chapter> = Vec::with_capacity(skeleton.num_chapters());
         for content in skeleton.chapters.iter_mut() {
             match content {
@@ -139,7 +127,7 @@ impl Parser for KatalepsisParser {
         }
 
         let hydrate = chapters.into_iter().map(|chap| async {
-            let page = client.get(&chap.url).send().await?.text().await?;
+            let page = get(&chap.url).await?.text().await?;
             let document = Document::from_read(page.as_bytes())?;
 
             let mut cw_empty_owner;
@@ -244,9 +232,8 @@ impl Parser for KatalepsisParser {
     }
 
     async fn get_story(&self, source: StorySource) -> Result<Story, ArchiveError> {
-        let client = self.get_client();
-        let story = self.get_skeleton(&client, source).await?;
-        self.fill_skeleton(&client, story).await
+        let story = self.get_skeleton(source).await?;
+        self.fill_skeleton(story).await
     }
 }
 

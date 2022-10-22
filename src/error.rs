@@ -4,6 +4,8 @@ use std::{error::Error, fmt};
 pub enum ArchiveError {
     Internal(String),
     BadSource(String),
+    NoIdInSource(String, String),
+    PageError(String),
     StoryNotExists(String),
     Io(std::io::Error),
     Request(reqwest::Error),
@@ -16,6 +18,11 @@ impl fmt::Display for ArchiveError {
         match *self {
             Self::Internal(ref s) => write!(f, "Internal error: {}", s),
             Self::BadSource(ref s) => write!(f, "Could not convert URL {} to a story source", s),
+            Self::NoIdInSource(ref url, ref name) => write!(
+                f,
+                "Url {url} maps to source {name} and must contain a story ID, but does not"
+            ),
+            Self::PageError(ref s) => write!(f, "{}", s),
             Self::StoryNotExists(ref s) => write!(
                 f,
                 "Story {} does not exist in the archive. Try adding it first.",
