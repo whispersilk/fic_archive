@@ -12,16 +12,18 @@ use std::iter;
 
 use crate::{
     client::get,
-    error::ArchiveError,
     parser::Parser,
-    structs::{Author, Chapter, ChapterText, Content, Section, Story, StorySource},
+    structs::{
+        Author, AuthorList, Chapter, ChapterText, Completed, Content, Section, Story, StorySource,
+    },
+    Result,
 };
 
 pub(crate) struct KatalepsisParser;
 
 #[async_trait]
 impl Parser for KatalepsisParser {
-    async fn get_skeleton(&self, source: StorySource) -> Result<Story, ArchiveError> {
+    async fn get_skeleton(&self, source: StorySource) -> Result<Story> {
         let main_page = get(&source.to_url()).await?.text().await?;
         let main_page = Document::from_read(main_page.as_bytes())?;
 
@@ -93,6 +95,7 @@ impl Parser for KatalepsisParser {
                                 .expect("Chapter tag should have an href")
                                 .to_owned(),
                             date_posted: FixedOffset::east(0).datetime_from_str("0", "%s").unwrap(),
+                            author: None,
                         })
                     })
                     .collect();
@@ -102,27 +105,29 @@ impl Parser for KatalepsisParser {
                     description: None,
                     chapters,
                     url: None,
+                    author: None,
                 })
             })
             .collect();
 
         Ok(Story {
             name,
-            author,
+            authors: AuthorList::new(author),
             description,
             url,
             tags,
             chapters,
             source,
+            completed: Completed::Incomplete,
         })
     }
 
-    async fn fill_skeleton(&self, mut skeleton: Story) -> Result<Story, ArchiveError> {
+    async fn fill_skeleton(&self, mut skeleton: Story) -> Result<Story> {
         let mut chapters: Vec<&mut Chapter> = Vec::with_capacity(skeleton.num_chapters());
         for content in skeleton.chapters.iter_mut() {
             match content {
-                Content::Section(sec) => chapters_from_section(sec, &mut chapters),
-                Content::Chapter(chap) => chapters.push(chap),
+                Content::Section(ref mut sec) => chapters_from_section(sec, &mut chapters),
+                Content::Chapter(ref mut chap) => chapters.push(chap),
             }
         }
 
@@ -231,7 +236,7 @@ impl Parser for KatalepsisParser {
         }
     }
 
-    async fn get_story(&self, source: StorySource) -> Result<Story, ArchiveError> {
+    async fn get_story(&self, source: StorySource) -> Result<Story> {
         let story = self.get_skeleton(source).await?;
         self.fill_skeleton(story).await
     }
@@ -240,8 +245,8 @@ impl Parser for KatalepsisParser {
 fn chapters_from_section<'a>(section: &'a mut Section, vec: &mut Vec<&'a mut Chapter>) {
     for content in section.chapters.iter_mut() {
         match content {
-            Content::Section(sec) => chapters_from_section(sec, vec),
-            Content::Chapter(chap) => vec.push(chap),
+            Content::Section(ref mut sec) => chapters_from_section(sec, vec),
+            Content::Chapter(ref mut chap) => vec.push(chap),
         }
     }
 }

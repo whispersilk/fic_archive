@@ -8,7 +8,8 @@ use crate::{
     client::get,
     error::ArchiveError,
     parser::Parser,
-    structs::{Author, Chapter, ChapterText, Content, Story, StorySource},
+    structs::{Author, AuthorList, Chapter, ChapterText, Completed, Content, Story, StorySource},
+    Result,
 };
 
 static CHAPTER_REGEX: (&str, once_cell::sync::OnceCell<regex::Regex>) =
@@ -18,7 +19,7 @@ pub(crate) struct RoyalRoadParser;
 
 #[async_trait]
 impl Parser for RoyalRoadParser {
-    async fn get_skeleton(&self, source: StorySource) -> Result<Story, ArchiveError> {
+    async fn get_skeleton(&self, source: StorySource) -> Result<Story> {
         let main_page = get(&source.to_url()).await?.text().await?;
         let main_page = Document::from_read(main_page.as_bytes())?;
         let chapters = main_page
@@ -95,6 +96,7 @@ impl Parser for RoyalRoadParser {
                     text: ChapterText::Dehydrated,
                     url,
                     date_posted,
+                    author: None,
                 })
             })
             .collect();
@@ -130,19 +132,21 @@ impl Parser for RoyalRoadParser {
             .find(predicate::Class("tags").child(predicate::Name("a")))
             .map(|elem| elem.text())
             .collect();
+        let completed = get_completed(&main_page, &source)?;
 
         Ok(Story {
             name: title,
-            author,
+            authors: AuthorList::new(author),
             description: Some(description),
             url: source.to_url(),
             tags,
             chapters,
             source,
+            completed,
         })
     }
 
-    async fn fill_skeleton(&self, mut skeleton: Story) -> Result<Story, ArchiveError> {
+    async fn fill_skeleton(&self, mut skeleton: Story) -> Result<Story> {
         let hydrate = skeleton
             .chapters
             .iter_mut()
@@ -156,10 +160,7 @@ impl Parser for RoyalRoadParser {
             });
 
         let results = join_all(hydrate).await;
-        if results
-            .iter()
-            .any(|res: &Result<(_, _), ArchiveError>| res.is_err())
-        {
+        if results.iter().any(|res: &Result<(_, _)>| res.is_err()) {
             return Err(ArchiveError::Internal("Oopsie!".to_owned()));
         }
 
@@ -181,8 +182,30 @@ impl Parser for RoyalRoadParser {
         Ok(skeleton)
     }
 
-    async fn get_story(&self, source: StorySource) -> Result<Story, ArchiveError> {
+    async fn get_story(&self, source: StorySource) -> Result<Story> {
         let story = self.get_skeleton(source).await?;
         self.fill_skeleton(story).await
     }
+}
+
+fn get_completed(document: &Document, source: &StorySource) -> Result<Completed> {
+    Ok(document
+        .find(predicate::Class("fiction-info"))
+        .next()
+        .ok_or(ArchiveError::PageError(format!(
+            "Royalroad: couldn't find story info panel (.fiction-info) for story at {}",
+            source.to_url()
+        )))?
+        .descendants()
+        .find(|d| {
+            d.is(predicate::Class("label")) && {
+                d.text().trim() == "ONGOING" || d.text().trim() == "COMPLETED"
+            }
+        })
+        .map(|d| match d.text().trim() {
+            "COMPLETED" => Completed::Complete,
+            "ONGOING" => Completed::Incomplete,
+            _ => unreachable!(),
+        })
+        .unwrap_or(Completed::Unknown))
 }

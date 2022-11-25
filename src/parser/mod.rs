@@ -10,6 +10,7 @@ use crate::{
 pub mod ao3;
 pub mod katalepsis;
 pub mod royalroad;
+pub mod xenforo;
 
 #[async_trait]
 pub trait Parser {

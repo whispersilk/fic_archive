@@ -11,6 +11,7 @@ pub enum ArchiveError {
     Request(reqwest::Error),
     Database(rusqlite::Error),
     Parse(chrono::format::ParseError),
+    ParseInt(std::num::ParseIntError),
 }
 
 impl fmt::Display for ArchiveError {
@@ -32,6 +33,7 @@ impl fmt::Display for ArchiveError {
             Self::Request(ref err) => err.fmt(f),
             Self::Database(ref err) => err.fmt(f),
             Self::Parse(ref err) => err.fmt(f),
+            Self::ParseInt(ref err) => err.fmt(f),
         }
     }
 }
@@ -57,6 +59,12 @@ impl From<rusqlite::Error> for ArchiveError {
 impl From<chrono::format::ParseError> for ArchiveError {
     fn from(err: chrono::format::ParseError) -> ArchiveError {
         Self::Parse(err)
+    }
+}
+
+impl From<std::num::ParseIntError> for ArchiveError {
+    fn from(err: std::num::ParseIntError) -> ArchiveError {
+        Self::ParseInt(err)
     }
 }
 

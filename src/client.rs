@@ -3,11 +3,11 @@ use serde::ser::Serialize;
 
 use std::time::Duration;
 
-use crate::error::ArchiveError;
+use crate::Result;
 
 static CLIENT: once_cell::sync::OnceCell<Client> = once_cell::sync::OnceCell::new();
 
-pub async fn get(url: &str) -> Result<Response, ArchiveError> {
+pub async fn get(url: &str) -> Result<Response> {
     let client: &Client =
         CLIENT.get_or_init(|| Client::builder().cookie_store(true).build().unwrap());
     let mut response = client.get(url).send().await?;
@@ -40,10 +40,7 @@ pub async fn get(url: &str) -> Result<Response, ArchiveError> {
     }
 }
 
-pub async fn get_with_query<T: Serialize + ?Sized>(
-    url: &str,
-    query: &T,
-) -> Result<Response, ArchiveError> {
+pub async fn get_with_query<T: Serialize + ?Sized>(url: &str, query: &T) -> Result<Response> {
     let client: &Client =
         CLIENT.get_or_init(|| Client::builder().cookie_store(true).build().unwrap());
     let mut response = client.get(url).query(query).send().await?;

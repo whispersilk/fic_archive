@@ -3,8 +3,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub(crate) struct Args {
+    #[arg(global = true, short, long, default_value = "fic_archive.db")]
+    pub db: String,
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
